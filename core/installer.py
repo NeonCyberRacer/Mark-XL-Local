@@ -10,6 +10,7 @@ import importlib.util
 import platform
 import subprocess
 import sys
+import threading
 from typing import Callable
 
 # ── Package lists ─────────────────────────────────────────────────────────
@@ -68,18 +69,32 @@ def _available(module: str) -> bool:
 def _pip(package: str, log: Callable | None = None) -> bool:
     if log:
         log(f"SYS: pip install {package} …")
-    result = subprocess.run(
-        [
-            sys.executable, "-m", "pip", "install", package,
-            "--quiet", "--disable-pip-version-check",
-        ],
-        capture_output=True,
-    )
-    ok = result.returncode == 0
-    if not ok and log:
-        stderr = result.stderr.decode(errors="replace").strip()
-        log(f"ERR: {package} install failed — {stderr[:140]}")
-    return ok
+
+    base_cmd = [
+        sys.executable, "-m", "pip", "install", package,
+        "--quiet", "--disable-pip-version-check",
+    ]
+    fallbacks = [
+        base_cmd + ["--user"],                    # sin permisos en site-packages
+        base_cmd + ["--break-system-packages"],   # PEP 668 (Linux)
+    ]
+
+    last_err = ""
+    for attempt, cmd in enumerate([base_cmd] + fallbacks, 1):
+        try:
+            result = subprocess.run(cmd, capture_output=True, timeout=600)
+        except subprocess.TimeoutExpired:
+            last_err = "timeout 600s"
+            continue
+        if result.returncode == 0:
+            if attempt > 1 and log:
+                log(f"SYS: {package} instalado (fallback {attempt-1})")
+            return True
+        last_err = result.stderr.decode(errors="replace").strip()
+
+    if log:
+        log(f"ERR: {package} install failed — {last_err[:140]}")
+    return False
 
 
 # ── Public API ────────────────────────────────────────────────────────────
@@ -119,20 +134,40 @@ def install_for_config(config: dict, log: Callable | None = None) -> None:
     if log:
         log(f"SYS: Installing {len(missing)} package(s): {pkg_names}")
 
+    failed: list[str] = []
     for _mod, pkg in missing:
-        _pip(pkg, log)
+        if not _pip(pkg, log):
+            failed.append(pkg)
 
-    # Playwright: install the package + download Chromium browser
+    # Playwright: en background para no bloquear el arranque
     if not _available("playwright"):
-        _pip("playwright", log)
-        if log:
-            log("SYS: Downloading Playwright browser (Chromium, ~150 MB — one-time)…")
-        subprocess.run(
-            [sys.executable, "-m", "playwright", "install", "chromium"],
-            capture_output=True,
-        )
-        if log:
-            log("SYS: Playwright browser ready.")
+        if _pip("playwright", log):
+            if log:
+                log("SYS: Descargando Chromium en background (~150 MB)…")
+            def _dl_playwright():
+                try:
+                    subprocess.run(
+                        [sys.executable, "-m", "playwright", "install", "chromium"],
+                        capture_output=True, timeout=900,
+                    )
+                    if log:
+                        log("SYS: Playwright browser listo.")
+                except Exception as e:
+                    if log:
+                        log(f"ERR: Playwright browser download: {e}")
+            threading.Thread(target=_dl_playwright, daemon=True).start()
+        else:
+            failed.append("playwright")
 
-    if log:
-        log("SYS: All dependencies ready ✓")
+    # Verificacion final
+    still_missing = [(mod, pkg) for mod, pkg in unique if not _available(mod)]
+    if failed:
+        if log:
+            log(f"ERR: {len(failed)} paquete(s) fallaron: {', '.join(failed)}")
+    elif still_missing:
+        names = ", ".join(p for _, p in still_missing)
+        if log:
+            log(f"ERR: Aun faltan tras instalar: {names}")
+    else:
+        if log:
+            log("SYS: Todas las dependencias listas ✓")

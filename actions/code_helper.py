@@ -1,3 +1,9 @@
+"""
+MARK XL — code_helper
+
+Genera, edita, explica, ejecuta, optimiza y depura código.
+Soporta Python, JavaScript, TypeScript, C#, Unity, shaders, etc.
+"""
 import subprocess
 import sys
 import json
@@ -5,141 +11,137 @@ import re
 import time
 from pathlib import Path
 
+from core.paths import get_desktop
+
 
 def get_base_dir():
     if getattr(sys, "frozen", False):
         return Path(sys.executable).parent
     return Path(__file__).resolve().parent.parent
 
+
 BASE_DIR           = get_base_dir()
-DESKTOP            = Path.home() / "Desktop"
+DESKTOP            = get_desktop()
 MAX_BUILD_ATTEMPTS = 3
 
 from core.llm_client import call_llm_text as _llm
 
 
+_EXT_MAP = {
+    "python": ".py", "py": ".py",
+    "javascript": ".js", "js": ".js",
+    "typescript": ".ts", "ts": ".ts",
+    "html": ".html", "css": ".css",
+    "java": ".java", "cpp": ".cpp", "c": ".c",
+    "bash": ".sh", "shell": ".sh", "powershell": ".ps1",
+    "sql": ".sql", "json": ".json", "rust": ".rs", "go": ".go",
+    "csharp": ".cs", "cs": ".cs", "c#": ".cs",
+    "unity": ".cs", "unityscript": ".cs",
+    "shader": ".shader", "hlsl": ".hlsl", "glsl": ".glsl",
+    "compute": ".compute",
+}
+
+_NON_RUNNABLE_EXT = {".cs", ".shader", ".hlsl", ".glsl", ".compute",
+                     ".java", ".cpp", ".c", ".go", ".rs"}
+
+
 def _clean_code(text: str) -> str:
+    if not text:
+        return ""
     text = text.strip()
-    text = re.sub(r"^```[a-zA-Z]*\n?", "", text)
-    text = re.sub(r"\n?```$", "", text)
+    match = re.search(r"```[a-zA-Z#]*\s*\n(.*?)```", text, re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    text = re.sub(r"^```[a-zA-Z#]*\s*", "", text)
+    text = re.sub(r"```\s*$", "", text)
     return text.strip()
 
 
 def _resolve_save_path(output_path: str, language: str) -> Path:
-    ext_map = {
-        "python": ".py", "py": ".py",
-        "javascript": ".js", "js": ".js",
-        "typescript": ".ts", "ts": ".ts",
-        "html": ".html", "css": ".css",
-        "java": ".java", "cpp": ".cpp", "c": ".c",
-        "bash": ".sh", "shell": ".sh", "powershell": ".ps1",
-        "sql": ".sql", "json": ".json", "rust": ".rs", "go": ".go",
-    }
     if output_path:
         p = Path(output_path)
-        return p if p.is_absolute() else DESKTOP / p
-    ext = ext_map.get((language or "python").lower(), ".py")
+        if p.is_absolute():
+            return p
+        target = (DESKTOP / p).resolve()
+        try:
+            target.relative_to(DESKTOP.resolve())
+        except ValueError:
+            target = DESKTOP / p.name
+        return target
+    ext = _EXT_MAP.get((language or "python").lower(), ".py")
     return DESKTOP / f"jarvis_code{ext}"
 
 
 def _read_file(file_path: str) -> tuple[str, str]:
     if not file_path:
-        return "", "No file path provided."
+        return "", "No se ha proporcionado ruta de archivo."
     p = Path(file_path)
     if not p.exists():
-        return "", f"File not found: {file_path}"
+        return "", f"Archivo no encontrado: {file_path}"
     try:
         return p.read_text(encoding="utf-8"), ""
     except Exception as e:
-        return "", f"Could not read file: {e}"
+        return "", f"No se pudo leer el archivo: {e}"
 
 
 def _save_file(path: Path, content: str) -> str:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
-        return f"Saved to: {path}"
+        return f"Guardado en: {path}"
     except Exception as e:
-        return f"Could not save: {e}"
+        return f"No se pudo guardar: {e}"
 
 
 def _preview(code: str, lines: int = 10) -> str:
     all_lines = code.splitlines()
-    preview   = "\n".join(all_lines[:lines])
-    suffix    = f"\n... ({len(all_lines) - lines} more lines)" if len(all_lines) > lines else ""
-    return preview + suffix
+    if len(all_lines) <= lines:
+        return code
+    cut = lines
+    for i in range(lines, 0, -1):
+        if not all_lines[i-1].strip():
+            cut = i
+            break
+    preview = "\n".join(all_lines[:cut])
+    return preview + f"\n... ({len(all_lines) - cut} líneas más)"
+def _get_system_prompt(lang: str) -> str:
+    lang_lower = (lang or "python").lower()
 
+    if lang_lower in ("csharp", "cs", "c#", "unity", "unityscript"):
+        return (
+            "Eres un desarrollador experto de Unity y C#. "
+            "Escribe scripts idiomáticos de Unity:\n"
+            "- Hereda de MonoBehaviour cuando corresponda.\n"
+            "- Usa [SerializeField] para exponer campos en el Inspector.\n"
+            "- Cachea GetComponent<T>() en Awake o Start.\n"
+            "- Nombra el archivo igual que la clase pública.\n"
+            "- Sigue las convenciones: PascalCase métodos públicos, "
+            "camelCase privados, m_ prefix opcional.\n"
+            "- Añade comentarios en ESPAÑOL.\n"
+            "Devuelve SOLO el código, sin markdown, sin backticks, sin explicaciones."
+        )
 
-def _has_error(output: str) -> bool:
-    error_signals = ["error", "exception", "traceback", "syntaxerror",
-                     "nameerror", "typeerror", "stderr", "failed", "crash"]
-    return any(s in output.lower() for s in error_signals)
+    if lang_lower in ("shader", "hlsl", "glsl"):
+        return (
+            "Eres un experto en shaders de Unity (ShaderLab / HLSL). "
+            "Escribe shaders compatibles con URP. "
+            "Devuelve SOLO el código, sin markdown, sin backticks."
+        )
 
+    return (
+        f"Eres un desarrollador experto en {lang}. "
+        f"Escribe código limpio, funcional y bien comentado en ESPAÑOL. "
+        f"Devuelve SOLO el código, sin markdown, sin backticks, sin explicaciones."
+    )
 
-def _take_screenshot() -> Path | None:
-    try:
-        import pyautogui
-        screenshot_path = Path.home() / "Desktop" / f"jarvis_debug_{int(time.time())}.png"
-        screenshot = pyautogui.screenshot()
-        screenshot.save(str(screenshot_path))
-        print(f"[Code] 📸 Screenshot: {screenshot_path}")
-        return screenshot_path
-    except Exception as e:
-        print(f"[Code] ⚠️ Screenshot failed: {e}")
-        return None
-
-
-def _image_to_base64(path: Path) -> str:
-    import base64
-    return base64.b64encode(path.read_bytes()).decode("utf-8")
-
-
-def _detect_intent(description: str, file_path: str, code: str) -> str:
-    desc = (description or "").lower()
-
-    screen_kw = ["ekrandaki", "screen", "ekranda", "bu hatayı", "why am i getting",
-                 "neden hata", "what's wrong", "ne yanlış", "screenshot", "görüntü"]
-    if any(k in desc for k in screen_kw):
-        return "screen_debug"
-
-    optimize_kw = ["optimize", "refactor", "clean up", "improve", "temizle",
-                   "iyileştir", "daha iyi", "make it better", "hızlandır"]
-    if any(k in desc for k in optimize_kw) and (code or file_path):
-        return "optimize"
-
-    if file_path:
-        p = Path(file_path)
-        edit_kw  = ["edit", "update", "modify", "change", "add", "remove",
-                    "refactor", "fix", "rename", "replace", "düzenle", "değiştir"]
-        run_kw   = ["run", "execute", "launch", "start", "çalıştır"]
-        build_kw = ["build", "make it work", "try", "attempt"]
-
-        if p.exists() and any(k in desc for k in edit_kw):
-            return "edit"
-        if p.exists() and any(k in desc for k in run_kw):
-            return "run"
-        if any(k in desc for k in build_kw):
-            return "build"
-        if p.exists():
-            return "explain"
-
-    explain_kw = ["explain", "what does", "describe", "analyze", "açıkla", "ne yapıyor"]
-    if any(k in desc for k in explain_kw) and (code or file_path):
-        return "explain"
-
-    build_kw = ["build", "make it work", "try and", "attempt"]
-    if any(k in desc for k in build_kw):
-        return "build"
-
-    return "write"
 
 def _write(description: str, language: str, output_path: str, player=None) -> tuple[str, Path]:
     lang   = language or "python"
-    system = f"You are an expert {lang} developer. Output ONLY raw code, no markdown, no backticks, no explanations."
+    system = _get_system_prompt(lang)
     prompt = (
-        f"Write clean, working, well-commented {lang} code.\n"
-        f"Handle errors and edge cases. Use modern best practices.\n\n"
-        f"Description: {description}\n\nCode:"
+        f"Escribe código {lang} limpio, funcional y bien comentado.\n"
+        f"Maneja errores y casos extremos. Usa mejores prácticas modernas.\n\n"
+        f"Descripción: {description}\n\nCódigo:"
     )
     code = _clean_code(_llm(prompt, system=system))
     path = _resolve_save_path(output_path, lang)
@@ -147,18 +149,35 @@ def _write(description: str, language: str, output_path: str, player=None) -> tu
     return code, path
 
 
-def _fix_code(code: str, error_output: str, description: str) -> str:
-    system = "You are an expert debugger. Return ONLY the corrected code — no explanation, no markdown, no backticks."
-    prompt = (
-        f"Fix the code below. It failed with this error.\n\n"
-        f"Original goal: {description}\n\n"
-        f"Error:\n{error_output[:2000]}\n\n"
-        f"Broken code:\n{code}\n\nFixed code:"
+def _fix_code(code: str, error_output: str, description: str, language: str) -> str:
+    system = (
+        f"Eres un experto depurador de {language}. "
+        f"Devuelve SOLO el código corregido — sin explicación, sin markdown, sin backticks."
     )
-    return _clean_code(_llm(prompt, system=system))
+    prompt = (
+        f"Corrige el código de abajo. Falló con este error.\n\n"
+        f"Objetivo original: {description}\n\n"
+        f"Error:\n{error_output[:2000]}\n\n"
+        f"Código roto:\n{code}\n\nCódigo corregido:"
+    )
+    fixed = _clean_code(_llm(prompt, system=system))
+
+    if (language or "").lower() in ("python", "py"):
+        try:
+            import ast
+            ast.parse(fixed)
+        except SyntaxError as e:
+            print(f"[Code] ⚠️ El fix tiene error de sintaxis: {e}")
+            return code
+
+    return fixed
 
 
-def _run_file(path: Path, args: list, timeout: int) -> str:
+def _run_file(path: Path, args: list, timeout: int) -> tuple[str, int]:
+    if path.suffix.lower() in _NON_RUNNABLE_EXT:
+        return (f"No se puede ejecutar {path.suffix} directamente. "
+                f"Ábrelo en el editor o IDE correspondiente.", 0)
+
     interpreters = {
         ".py":  [sys.executable],
         ".js":  ["node"],
@@ -170,11 +189,16 @@ def _run_file(path: Path, args: list, timeout: int) -> str:
     }
     interp = interpreters.get(path.suffix.lower())
     if not interp:
-        return f"No interpreter for {path.suffix}."
+        return f"No hay intérprete para {path.suffix}.", 0
+
+    if isinstance(args, str):
+        args = args.split()
+    elif not isinstance(args, list):
+        args = []
 
     try:
         result = subprocess.run(
-            interp + [str(path)] + (args or []),
+            interp + [str(path)] + args,
             capture_output=True, text=True,
             encoding="utf-8", errors="replace",
             timeout=timeout, cwd=str(path.parent)
@@ -184,109 +208,168 @@ def _run_file(path: Path, args: list, timeout: int) -> str:
         parts  = []
         if output: parts.append(f"Output:\n{output}")
         if error:  parts.append(f"Stderr:\n{error}")
-        return "\n\n".join(parts) if parts else "Executed with no output."
+        combined = "\n\n".join(parts) if parts else "Ejecutado sin output."
+        return combined, result.returncode
 
     except subprocess.TimeoutExpired:
-        return f"Timed out after {timeout}s."
+        return f"Timeout tras {timeout}s.", 0
     except FileNotFoundError:
-        return f"Interpreter not found: {interp[0]}."
+        return f"Intérprete no encontrado: {interp[0]}.", 1
     except Exception as e:
-        return f"Execution error: {e}"
+        return f"Error de ejecución: {e}", 1
+
+
+def _has_error(output: str, returncode: int) -> bool:
+    if returncode == 0:
+        return False
+    if "timeout" in output.lower() or "timed out" in output.lower():
+        return False
+    text = output.lower()
+    strong_signals = [
+        "traceback (most recent call last)",
+        "syntaxerror:", "nameerror:", "typeerror:", "valueerror:",
+        "indexerror:", "keyerror:", "attributeerror:", "importerror:",
+        "modulenotfounderror:", "runtimeerror:", "zerodivisionerror:",
+        "filenotfounderror:", "permissionerror:",
+    ]
+    return any(s in text for s in strong_signals)
 
 
 def _build(description, language, output_path, args, timeout, speak=None, player=None) -> str:
     if not description:
-        return "Please describe what you want me to build, sir."
+        return "Dime qué quieres que construya, señor."
+
+    lang = (language or "python").lower()
+    is_non_runnable = lang in ("csharp", "cs", "c#", "unity", "unityscript",
+                                "shader", "hlsl", "glsl", "compute",
+                                "java", "cpp", "c")
 
     if player:
-        player.write_log("[Code] Build started...")
+        player.write_log("[Code] Construyendo...")
 
-    lang = language or "python"
+    if is_non_runnable:
+        try:
+            code, path = _write(description, lang, output_path, player)
+        except Exception as e:
+            msg = f"No pude escribir el código: {e}"
+            if speak: speak(msg)
+            return msg
+
+        msg = (
+            f"Archivo {lang} guardado en {path}. "
+            f"Ábrelo en Unity o tu IDE."
+        )
+        if speak: speak(msg)
+        return f"{msg}\n\nVista previa:\n{_preview(code, 20)}"
 
     try:
         code, path = _write(description, lang, output_path, player)
-        print(f"[Code] ✅ Written: {path}")
+        print(f"[Code] ✅ Escrito: {path}")
     except Exception as e:
-        msg = f"Could not write initial code: {e}"
+        msg = f"No pude escribir el código inicial: {e}"
         if speak: speak(msg)
         return msg
 
     last_output = ""
     for attempt in range(1, MAX_BUILD_ATTEMPTS + 1):
-        print(f"[Code] 🔄 Attempt {attempt}/{MAX_BUILD_ATTEMPTS}")
+        print(f"[Code] 🔄 Intento {attempt}/{MAX_BUILD_ATTEMPTS}")
         if player:
-            player.write_log(f"[Code] Attempt {attempt}...")
+            player.write_log(f"[Code] Intento {attempt}...")
 
-        last_output = _run_file(path, args, timeout)
+        last_output, returncode = _run_file(path, args, timeout)
 
-        if not _has_error(last_output):
+        if not _has_error(last_output, returncode):
             msg = (
-                f"Build complete, sir. "
-                f"The code is working after {attempt} attempt{'s' if attempt > 1 else ''}. "
-                f"Saved to {path}."
+                f"Build completado, señor. "
+                f"El código funciona tras {attempt} intento{'s' if attempt > 1 else ''}. "
+                f"Guardado en {path}."
             )
             if speak: speak(msg)
             return f"{msg}\n\nOutput:\n{last_output}"
 
-        print(f"[Code] ⚠️ Error on attempt {attempt}, fixing...")
+        print(f"[Code] ⚠️ Error en intento {attempt}, arreglando...")
         if player:
-            player.write_log(f"[Code] Fixing (attempt {attempt})...")
+            player.write_log(f"[Code] Arreglando (intento {attempt})...")
 
         try:
-            code = _fix_code(code, last_output, description)
+            code = _fix_code(code, last_output, description, lang)
             _save_file(path, code)
         except Exception as e:
-            msg = f"Could not fix code on attempt {attempt}: {e}"
+            msg = f"No pude arreglar el código en el intento {attempt}: {e}"
             if speak: speak(msg)
             return msg
 
     msg = (
-        f"I was unable to build a working version after {MAX_BUILD_ATTEMPTS} attempts, sir. "
-        f"The last error was: {last_output[:200]}"
+        f"No pude conseguir una versión funcional tras {MAX_BUILD_ATTEMPTS} intentos, señor. "
+        f"El último error fue: {last_output[:200]}"
     )
     if speak: speak(msg)
-    return f"{msg}\n\nLast code saved to: {path}"
+    return f"{msg}\n\nÚltimo código guardado en: {path}"
+def _save_direct(content: str, output_path: str, language: str, player=None) -> str:
+    """Guarda contenido ya generado sin llamar al LLM."""
+    if not content or not content.strip():
+        return "No hay contenido para guardar."
+
+    if not output_path:
+        target = _resolve_save_path("", language)
+    else:
+        target = _resolve_save_path(output_path, language)
+
+    status = _save_file(target, content)
+    print(f"[Code] Guardado directo: {target}")
+
+    if player and hasattr(player, "write_log"):
+        try:
+            player.write_log(f"[Code] Guardado: {target}")
+        except Exception:
+            pass
+
+    return f"Código guardado en: {target}\n\nVista previa:\n{_preview(content, 15)}"
+
 
 def _write_action(description, language, output_path, player) -> str:
     if not description:
-        return "Please describe what you want me to write, sir."
+        return "Dime qué quieres que escriba, señor."
     if player:
-        player.write_log("[Code] Writing code...")
+        player.write_log("[Code] Escribiendo código...")
     try:
         code, path = _write(description, language, output_path, player)
-        print(f"[Code] ✅ Written: {path}")
-        return f"Code written. Saved to: {path}\n\nPreview:\n{_preview(code)}"
+        print(f"[Code] ✅ Escrito: {path}")
+        return f"Código escrito. Guardado en: {path}\n\nVista previa:\n{_preview(code)}"
     except Exception as e:
-        return f"Could not generate code: {e}"
+        return f"No pude generar el código: {e}"
 
 
 def _edit_action(file_path, instruction, player) -> str:
     if not file_path:
-        return "Please provide a file path to edit, sir."
+        return "Necesito una ruta de archivo para editar, señor."
     if not instruction:
-        return "Please describe what change to make, sir."
+        return "Dime qué cambio hacer, señor."
 
     content, err = _read_file(file_path)
     if err:
         return err
 
     if player:
-        player.write_log("[Code] Editing file...")
+        player.write_log("[Code] Editando archivo...")
 
-    system = "You are an expert code editor. Return ONLY the complete updated code — no explanation, no markdown, no backticks."
+    system = (
+        "Eres un editor de código experto. "
+        "Devuelve SOLO el código completo actualizado — sin explicación, sin markdown."
+    )
     prompt = (
-        f"Apply the following change to the code below.\n\n"
-        f"Change: {instruction}\n\n"
-        f"Original code:\n{content}\n\nUpdated code:"
+        f"Aplica el siguiente cambio al código de abajo.\n\n"
+        f"Cambio: {instruction}\n\n"
+        f"Código original:\n{content}\n\nCódigo actualizado:"
     )
     try:
         edited = _clean_code(_llm(prompt, system=system))
     except Exception as e:
-        return f"Could not edit code: {e}"
+        return f"No pude editar el código: {e}"
 
     status = _save_file(Path(file_path), edited)
-    print(f"[Code] ✅ Edited: {file_path}")
-    return f"File edited. {status}\n\nPreview:\n{_preview(edited)}"
+    print(f"[Code] ✅ Editado: {file_path}")
+    return f"Archivo editado. {status}\n\nVista previa:\n{_preview(edited)}"
 
 
 def _explain_action(file_path, code, player) -> str:
@@ -295,130 +378,170 @@ def _explain_action(file_path, code, player) -> str:
         if err:
             return err
     if not code:
-        return "Please provide code or a file path to explain, sir."
+        return "Dame código o una ruta de archivo para explicar, señor."
 
     if player:
-        player.write_log("[Code] Analyzing code...")
+        player.write_log("[Code] Analizando código...")
 
-    system = "You are an expert programmer. Explain code concisely in 3-6 sentences."
+    system = (
+        "Eres un programador experto. "
+        "Explica el código de forma concisa en 3-6 frases. "
+        "Responde SIEMPRE en español."
+    )
     prompt = (
-        f"Explain what this code does — what it does, how it works, important details.\n\n"
-        f"Code:\n{code[:4000]}\n\nExplanation:"
+        f"Explica qué hace este código — qué hace, cómo funciona, detalles importantes.\n\n"
+        f"Código:\n{code[:4000]}\n\nExplicación:"
     )
     try:
         return _llm(prompt, system=system)
     except Exception as e:
-        return f"Could not explain code: {e}"
+        return f"No pude explicar el código: {e}"
 
 
 def _run_action(file_path, args, timeout, player) -> str:
     if not file_path:
-        return "Please provide a file path to run, sir."
+        return "Necesito una ruta de archivo para ejecutar, señor."
     p = Path(file_path)
     if not p.exists():
-        return f"File not found: {file_path}"
+        return f"Archivo no encontrado: {file_path}"
     if player:
-        player.write_log(f"[Code] Running {p.name}...")
-    return _run_file(p, args, timeout)
+        player.write_log(f"[Code] Ejecutando {p.name}...")
+    output, _ = _run_file(p, args, timeout)
+    return output
 
 
 def _optimize_action(file_path, code, language, output_path, player) -> str:
-
     if file_path and not code:
         code, err = _read_file(file_path)
         if err:
             return err
     if not code:
-        return "Please provide code or a file path to optimize, sir."
+        return "Dame código o una ruta de archivo para optimizar, señor."
 
     if player:
-        player.write_log("[Code] Optimizing code...")
+        player.write_log("[Code] Optimizando código...")
 
     lang   = language or "python"
-    system = f"You are an expert {lang} developer. Return ONLY the optimized code — no explanation, no markdown, no backticks."
+    system = (
+        f"Eres un desarrollador experto en {lang}. "
+        f"Devuelve SOLO el código optimizado — sin explicación, sin markdown."
+    )
     prompt = (
-        f"Optimize this {lang} code for performance, readability, and best practices. "
-        f"Remove dead code and unnecessary complexity.\n\n"
-        f"Original code:\n{code[:6000]}\n\nOptimized code:"
+        f"Optimiza este código {lang} para rendimiento, legibilidad y buenas prácticas. "
+        f"Elimina código muerto y complejidad innecesaria.\n\n"
+        f"Código original:\n{code[:6000]}\n\nCódigo optimizado:"
     )
     try:
         optimized = _clean_code(_llm(prompt, system=system))
     except Exception as e:
-        return f"Could not optimize code: {e}"
+        return f"No pude optimizar el código: {e}"
 
-    # Kaydet
     if file_path:
         save_path = Path(file_path)
     else:
         save_path = _resolve_save_path(output_path, lang)
 
     status = _save_file(save_path, optimized)
-    print(f"[Code] ✅ Optimized: {save_path}")
+    print(f"[Code] ✅ Optimizado: {save_path}")
 
     original_lines  = len(code.splitlines())
     optimized_lines = len(optimized.splitlines())
     diff = original_lines - optimized_lines
 
     return (
-        f"Code optimized. {status}\n"
-        f"Lines: {original_lines} → {optimized_lines} "
-        f"({'−' if diff > 0 else '+'}{abs(diff)} lines)\n\n"
-        f"Preview:\n{_preview(optimized)}"
+        f"Código optimizado. {status}\n"
+        f"Líneas: {original_lines} → {optimized_lines} "
+        f"({'−' if diff > 0 else '+'}{abs(diff)} líneas)\n\n"
+        f"Vista previa:\n{_preview(optimized)}"
     )
 
 
+def _take_screenshot() -> Path | None:
+    """Captura de pantalla con mss (más fiable que pyautogui)."""
+    try:
+        import mss
+        import mss.tools
+        with mss.mss() as sct:
+            monitor = sct.monitors[1]
+            sct_img = sct.grab(monitor)
+            path = DESKTOP / f"jarvis_debug_{int(time.time())}.png"
+            mss.tools.to_png(sct_img.rgb, sct_img.size, output=str(path))
+            print(f"[Code] 📸 Screenshot: {path}")
+            return path
+    except ImportError:
+        pass
+
+    try:
+        import pyautogui
+        path = DESKTOP / f"jarvis_debug_{int(time.time())}.png"
+        screenshot = pyautogui.screenshot()
+        screenshot.save(str(path))
+        print(f"[Code] 📸 Screenshot (pyautogui): {path}")
+        return path
+    except Exception as e:
+        print(f"[Code] ⚠️ Screenshot failed: {e}")
+        return None
+
+
 def _screen_debug_action(description, file_path, player, speak=None) -> str:
-
     if player:
-        player.write_log("[Code] Taking screenshot for analysis...")
+        player.write_log("[Code] Capturando pantalla para análisis...")
 
-    print("[Code] 📸 Capturing screen for debug...")
-
+    print("[Code] 📸 Capturando pantalla para debug...")
 
     screenshot_path = _take_screenshot()
     if not screenshot_path:
-        return "Could not take screenshot, sir. Please make sure PyAutoGUI is installed."
-
+        return "No pude hacer la captura, señor. ¿Está instalado mss o pyautogui?"
 
     file_content = ""
     if file_path:
         file_content, err = _read_file(file_path)
         if err:
-            print(f"[Code] ⚠️ Could not read file: {err}")
+            print(f"[Code] ⚠️ No pude leer el archivo: {err}")
 
     try:
         import base64, json as _json, requests as _req
         from pathlib import Path as _Path
 
-        cfg          = {}
-        cfg_file     = _Path(__file__).resolve().parent.parent / "config" / "api_keys.json"
+        cfg = {}
+        cfg_file = _Path(__file__).resolve().parent.parent / "config" / "api_keys.json"
         try:
             cfg = _json.loads(cfg_file.read_text(encoding="utf-8"))
         except Exception:
             pass
 
-        ollama_url    = cfg.get("llm_url", "http://localhost:11434").rstrip("/")
-        vision_model  = cfg.get("vision_model") or cfg.get("llm_model", "llava")
+        ollama_url   = cfg.get("llm_url", "http://localhost:11434").rstrip("/")
+        vision_model = cfg.get("vision_model", "").strip()
 
-        image_bytes   = screenshot_path.read_bytes()
-        b64           = base64.b64encode(image_bytes).decode("ascii")
-        user_question = description or "What error or problem do you see on the screen? How can it be fixed?"
-        context       = ""
+        if not vision_model:
+            screenshot_path.unlink(missing_ok=True)
+            return (
+                "No hay modelo de visión configurado. "
+                "Añade 'vision_model' a config/api_keys.json. "
+                "Ejemplo: qwen2.5vl:7b"
+            )
+
+        image_bytes = screenshot_path.read_bytes()
+        b64         = base64.b64encode(image_bytes).decode("ascii")
+
+        user_question = description or "¿Qué error o problema ves en la pantalla? ¿Cómo se puede arreglar?"
+        context = ""
         if file_content:
-            context = f"\n\nRelated file content:\n```\n{file_content[:4000]}\n```"
+            context = f"\n\nContenido del archivo relacionado:\n```\n{file_content[:4000]}\n```"
 
         analysis_prompt = (
-            f"You are an expert programmer/debugger analyzing a screenshot.\n\n"
-            f"User question: {user_question}{context}\n\n"
-            f"Identify errors, explain the cause, and provide a fix. "
-            f"If you see code, show the corrected version."
+            f"Eres un programador/depurador experto analizando una captura de pantalla.\n\n"
+            f"Pregunta del usuario: {user_question}{context}\n\n"
+            f"Identifica errores, explica la causa y proporciona una solución. "
+            f"Si ves código, muestra la versión corregida. "
+            f"Responde SIEMPRE en español."
         )
 
         resp = _req.post(
             f"{ollama_url}/api/chat",
             json={
-                "model":   vision_model,
-                "stream":  False,
+                "model":    vision_model,
+                "stream":   False,
                 "messages": [
                     {
                         "role":    "user",
@@ -427,34 +550,94 @@ def _screen_debug_action(description, file_path, player, speak=None) -> str:
                     }
                 ],
             },
-            timeout=60,
+            timeout=90,
         )
         resp.raise_for_status()
         analysis = (resp.json().get("message", {}).get("content") or "").strip()
-        print("[Code] ✅ Screen analysis complete")
-
-        try:
-            screenshot_path.unlink()
-        except Exception:
-            pass
+        print("[Code] ✅ Análisis de pantalla completado")
 
         if file_path and file_content:
-            code_match = re.search(r"```[a-zA-Z]*\n(.*?)```", analysis, re.DOTALL)
+            code_match = re.search(r"```[a-zA-Z#]*\n(.*?)```", analysis, re.DOTALL)
             if code_match:
                 fixed_code = code_match.group(1).strip()
                 save_path  = Path(file_path)
                 _save_file(save_path, fixed_code)
-                analysis += f"\n\n✅ Fixed code has been saved to: {file_path}"
-                print(f"[Code] ✅ Fixed code saved: {file_path}")
+                analysis += f"\n\n✅ Código corregido guardado en: {file_path}"
+                print(f"[Code] ✅ Código corregido guardado: {file_path}")
 
+        screenshot_path.unlink(missing_ok=True)
         return analysis
 
     except Exception as e:
         try:
-            screenshot_path.unlink()
+            screenshot_path.unlink(missing_ok=True)
         except Exception:
             pass
-        return f"Screen analysis failed: {e}"
+        return f"El análisis de pantalla falló: {e}"
+def _detect_intent(description: str, file_path: str, code: str) -> str:
+    """Detecta la acción apropiada según la descripción (español + inglés)."""
+    desc = (description or "").lower()
+
+    screen_kw = [
+        "screen", "why am i getting", "what's wrong", "screenshot",
+        "pantalla", "qué ves", "que ves", "qué hay en pantalla",
+        "por qué falla", "por que falla", "qué error", "que error",
+        "captura", "mira la pantalla", "analiza la pantalla",
+    ]
+    if any(k in desc for k in screen_kw):
+        return "screen_debug"
+
+    optimize_kw = [
+        "optimize", "refactor", "clean up", "improve", "make it better",
+        "optimiza", "optimizar", "refactoriza", "mejora", "limpia",
+        "hazlo mejor", "más rápido", "mas rapido",
+    ]
+    if any(k in desc for k in optimize_kw) and (code or file_path):
+        return "optimize"
+
+    if file_path:
+        p = Path(file_path)
+        edit_kw = [
+            "edit", "update", "modify", "change", "add", "remove",
+            "refactor", "fix", "rename", "replace",
+            "edita", "editar", "actualiza", "modifica", "cambia",
+            "añade", "anade", "quita", "elimina", "arregla", "corrige",
+            "renombra", "reemplaza",
+        ]
+        run_kw = [
+            "run", "execute", "launch", "start",
+            "ejecuta", "ejecutar", "corre", "lanza", "arranca", "prueba",
+        ]
+        build_kw = [
+            "build", "make it work", "try", "attempt",
+            "construye", "compila", "haz que funcione", "intenta",
+        ]
+
+        if p.exists() and any(k in desc for k in edit_kw):
+            return "edit"
+        if p.exists() and any(k in desc for k in run_kw):
+            return "run"
+        if any(k in desc for k in build_kw):
+            return "build"
+        if p.exists():
+            return "explain"
+
+    explain_kw = [
+        "explain", "what does", "describe", "analyze",
+        "explica", "explicar", "describe", "analiza",
+        "qué hace", "que hace", "cómo funciona", "como funciona",
+    ]
+    if any(k in desc for k in explain_kw) and (code or file_path):
+        return "explain"
+
+    build_kw = [
+        "build", "make it work", "try and", "attempt",
+        "construye", "compila", "haz que funcione",
+    ]
+    if any(k in desc for k in build_kw):
+        return "build"
+
+    return "write"
 
 
 def code_helper(
@@ -465,21 +648,36 @@ def code_helper(
     speak=None
 ) -> str:
     """
-    Called from main.py.
+    Router principal.
 
     parameters:
         action      : write | edit | explain | run | build | screen_debug | optimize | auto
-        description : What the code should do / what change to make / what problem to analyze
-        language    : Programming language (default: python)
-        output_path : Where to save — user specifies full path or filename
-        file_path   : Path to existing file (edit / explain / run / build / optimize)
-        code        : Raw code string (explain/optimize without a file)
-        args        : CLI argument list for run/build
-        timeout     : Execution timeout in seconds (default: 30)
+        description : Qué debe hacer el código / qué cambio hacer / qué problema analizar
+        language    : Lenguaje (default: python)
+        output_path : Dónde guardar
+        file_path   : Ruta a archivo existente
+        code        : Código raw (para explain/optimize sin archivo)
+        args        : Lista de args CLI
+        timeout     : Timeout de ejecución
     """
     p           = parameters or {}
     action      = p.get("action", "auto").lower().strip()
     description = p.get("description", "").strip()
+
+    # Normalizar actions comunes que los LLM usan mal
+    _ACTION_MAP = {
+        "create": "write", "make": "write", "generate": "write",
+        "new": "write", "build_file": "write", "add": "write",
+        "execute": "run", "run_code": "run", "start": "run",
+        "analyze": "explain", "describe": "explain", "what": "explain",
+        "refactor": "optimize", "improve": "optimize", "clean": "optimize",
+        "modify": "edit", "update": "edit", "change": "edit",
+        "debug": "screen_debug", "vision": "screen_debug",
+    }
+    if action in _ACTION_MAP:
+        original = action
+        action = _ACTION_MAP[action]
+        print(f"[Code] Action normalizada: {original} -> {action}")
     language    = p.get("language", "python").strip()
     output_path = p.get("output_path", "").strip()
     file_path   = p.get("file_path", "").strip()
@@ -489,11 +687,17 @@ def code_helper(
 
     if action == "auto":
         action = _detect_intent(description, file_path, code)
-        print(f"[Code] 🤖 Auto-detected: {action}")
+        print(f"[Code] 🤖 Auto-detectado: {action}")
 
     if action == "write":
-        return _write_action(description, language, output_path, player)
+        # Si el LLM ya nos da el código en `content` o `code`, guardarlo directo
+        direct_code = p.get("content") or p.get("code")
+        if direct_code and isinstance(direct_code, str) and len(direct_code.strip()) > 20:
+            if any(k in direct_code for k in ("using ", "class ", "def ", "function ", "import ")):
+                target = output_path or file_path or ""
+                return _save_direct(direct_code, target, language, player)
 
+        return _write_action(description, language, output_path, player)
     elif action == "edit":
         return _edit_action(
             file_path,
@@ -517,4 +721,5 @@ def code_helper(
         return _screen_debug_action(description, file_path, player, speak)
 
     else:
-        return f"Unknown action: '{action}'. Use write, edit, explain, run, build, optimize, or screen_debug."
+        return (f"Acción desconocida: '{action}'. "
+                f"Usa write, edit, explain, run, build, optimize o screen_debug.")

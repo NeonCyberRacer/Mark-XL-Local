@@ -47,10 +47,13 @@ class TaskQueue:
         self._executor       = None  
 
     def _get_executor(self):
-        if self._executor is None:
-            from agent.executor import AgentExecutor
-            self._executor = AgentExecutor()
-        return self._executor
+        if self._executor is not None:
+            return self._executor
+        with self._lock:
+            if self._executor is None:
+                from agent.executor import AgentExecutor
+                self._executor = AgentExecutor()
+            return self._executor
 
     def start(self) -> None:
         if self._running:
@@ -98,8 +101,7 @@ class TaskQueue:
         return task_id
 
     def cancel(self, task_id: str) -> bool:
-
-        with self._lock:
+        with self._condition:
             task = self._tasks.get(task_id)
             if not task:
                 return False
@@ -107,8 +109,17 @@ class TaskQueue:
                 return False
 
             task.cancel_flag.set()
+
+            # Si estaba PENDING, quitarla de la cola
+            if task.status == TaskStatus.PENDING:
+                try:
+                    self._queue.remove(task)
+                except ValueError:
+                    pass
+
             task.status = TaskStatus.CANCELLED
-            print(f"[TaskQueue] 🚫 Task cancelled: [{task_id}]")
+            self._condition.notify()
+            print(f"[TaskQueue] Tarea cancelada: [{task_id}]")
             return True
 
     def get_status(self, task_id: str) -> dict | None:
@@ -137,16 +148,23 @@ class TaskQueue:
 
     def pending_count(self) -> int:
         with self._lock:
-            return sum(1 for t in self._queue if t.status == TaskStatus.PENDING)
+            return sum(
+                1 for t in self._queue
+                if t.status == TaskStatus.PENDING and not t.cancel_flag.is_set()
+            )
 
     def _worker_loop(self) -> None:
         while self._running:
             task = None
 
             with self._condition:
-                while self._running and not self._next_task():
+                # Esperar hasta que haya una tarea disponible
+                while self._running:
+                    task = self._next_task()
+                    if task is not None:
+                        break
                     self._condition.wait(timeout=1.0)
-                task = self._next_task()
+
                 if task:
                     task.status = TaskStatus.RUNNING
                     self._active_count += 1
@@ -172,7 +190,7 @@ class TaskQueue:
         return None
 
     def _run_task(self, task: Task) -> None:
-        print(f"[TaskQueue] ▶️ Running: [{task.task_id}] {task.goal[:60]}")
+        print(f"[TaskQueue] Running: [{task.task_id}] {task.goal[:60]}")
         try:
             executor = self._get_executor()
             result   = executor.execute(
@@ -187,25 +205,26 @@ class TaskQueue:
                 else:
                     task.status = TaskStatus.COMPLETED
                     task.result = result
-                self._active_count -= 1
 
             if task.on_complete and not task.cancel_flag.is_set():
                 try:
                     task.on_complete(task.task_id, result)
                 except Exception as e:
-                    print(f"[TaskQueue] ⚠️ on_complete callback error: {e}")
+                    print(f"[TaskQueue] on_complete callback error: {e}")
 
-            print(f"[TaskQueue] ✅ Completed: [{task.task_id}]")
+            print(f"[TaskQueue] Completada: [{task.task_id}]")
 
         except Exception as e:
             with self._lock:
                 task.status = TaskStatus.FAILED
                 task.error  = str(e)
-                self._active_count -= 1
-            print(f"[TaskQueue] ❌ Failed: [{task.task_id}] {e}")
+            print(f"[TaskQueue] Fallida: [{task.task_id}] {e}")
 
-        with self._condition:
-            self._condition.notify()
+        finally:
+            # SIEMPRE decrementar el contador, incluso con BaseException
+            with self._condition:
+                self._active_count -= 1
+                self._condition.notify()
 
 _queue        = TaskQueue()
 _queue_started = False

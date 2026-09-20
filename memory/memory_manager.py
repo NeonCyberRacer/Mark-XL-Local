@@ -44,6 +44,17 @@ def load_memory() -> dict:
             print(f"[Memory] ⚠️ Load error: {e}")
             return _empty_memory()
 
+
+def _safe_value(val) -> str:
+    """Sanitiza un valor para evitar romper el prompt."""
+    if not isinstance(val, str):
+        val = str(val)
+    # Colapsar saltos de linea multiples
+    val = " ".join(val.split())
+    # Quitar corchetes que parezcan tags del prompt
+    val = val.replace("[", "(").replace("]", ")")
+    return val
+
 def _all_entries(memory: dict) -> list[tuple]:
     entries = []
     for cat, items in memory.items():
@@ -111,11 +122,35 @@ def _recursive_update(target: dict, updates: dict) -> bool:
 def update_memory(memory_update: dict) -> dict:
     if not isinstance(memory_update, dict) or not memory_update:
         return load_memory()
-    memory = load_memory()
-    if _recursive_update(memory, memory_update):
-        save_memory(memory)
-        print(f"[Memory] 💾 Saved: {list(memory_update.keys())}")
-    return memory
+    # Lock atomico: load+merge+save sin intervencion de otro hilo
+    with _lock:
+        if not MEMORY_PATH.exists():
+            memory = _empty_memory()
+        else:
+            try:
+                import json as _json
+                memory = _json.loads(MEMORY_PATH.read_text(encoding="utf-8"))
+                if not isinstance(memory, dict):
+                    memory = _empty_memory()
+                else:
+                    base = _empty_memory()
+                    for key in base:
+                        if key not in memory:
+                            memory[key] = {}
+            except Exception as e:
+                print(f"[Memory] Load error en update: {e}")
+                memory = _empty_memory()
+
+        if _recursive_update(memory, memory_update):
+            memory = _trim_to_limit(memory)
+            MEMORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+            import json as _json
+            MEMORY_PATH.write_text(
+                _json.dumps(memory, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            print(f"[Memory] Guardado: {list(memory_update.keys())}")
+        return memory
 
 def format_memory_for_prompt(memory: dict | None) -> str:
     if not memory:
@@ -130,7 +165,7 @@ def format_memory_for_prompt(memory: dict | None) -> str:
         if entry:
             val = entry.get("value") if isinstance(entry, dict) else entry
             if val:
-                lines.append(f"{field.title()}: {val}")
+                lines.append(f"{field.title()}: {_safe_value(val)}")
     for key, entry in identity.items():
         if key in id_fields:
             continue
@@ -145,7 +180,7 @@ def format_memory_for_prompt(memory: dict | None) -> str:
         for key, entry in list(prefs.items())[:15]:
             val = entry.get("value") if isinstance(entry, dict) else entry
             if val:
-                lines.append(f"  - {key.replace('_', ' ').title()}: {val}")
+                lines.append(f"  - {key.replace('_', ' ').title()}: {_safe_value(val)}")
 
     projects = memory.get("projects", {})
     if projects:
@@ -154,7 +189,7 @@ def format_memory_for_prompt(memory: dict | None) -> str:
         for key, entry in list(projects.items())[:8]:
             val = entry.get("value") if isinstance(entry, dict) else entry
             if val:
-                lines.append(f"  - {key.replace('_', ' ').title()}: {val}")
+                lines.append(f"  - {key.replace('_', ' ').title()}: {_safe_value(val)}")
 
     rels = memory.get("relationships", {})
     if rels:
@@ -163,7 +198,7 @@ def format_memory_for_prompt(memory: dict | None) -> str:
         for key, entry in list(rels.items())[:10]:
             val = entry.get("value") if isinstance(entry, dict) else entry
             if val:
-                lines.append(f"  - {key.replace('_', ' ').title()}: {val}")
+                lines.append(f"  - {key.replace('_', ' ').title()}: {_safe_value(val)}")
 
     wishes = memory.get("wishes", {})
     if wishes:
@@ -172,7 +207,7 @@ def format_memory_for_prompt(memory: dict | None) -> str:
         for key, entry in list(wishes.items())[:8]:
             val = entry.get("value") if isinstance(entry, dict) else entry
             if val:
-                lines.append(f"  - {key.replace('_', ' ').title()}: {val}")
+                lines.append(f"  - {key.replace('_', ' ').title()}: {_safe_value(val)}")
 
     notes = memory.get("notes", {})
     if notes:
@@ -181,7 +216,7 @@ def format_memory_for_prompt(memory: dict | None) -> str:
         for key, entry in list(notes.items())[:8]:
             val = entry.get("value") if isinstance(entry, dict) else entry
             if val:
-                lines.append(f"  - {key}: {val}")
+                lines.append(f"  - {key}: {_safe_value(val)}")
 
     if not lines:
         return ""
@@ -189,7 +224,11 @@ def format_memory_for_prompt(memory: dict | None) -> str:
     header = "[WHAT YOU KNOW ABOUT THIS PERSON — use naturally, never recite like a list]\n"
     result = header + "\n".join(lines)
     if len(result) > 2000:
-        result = result[:1997] + "…"
+        # Truncar por lineas, no por chars, para no cortar a mitad
+        while len(result) > 2000 and lines:
+            lines.pop()
+            result = header + "\n".join(lines)
+        result += "\n[...memoria adicional truncada]"
 
     return result + "\n"
 

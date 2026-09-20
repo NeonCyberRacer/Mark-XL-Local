@@ -23,11 +23,13 @@ PLANNER_PROMPT = """You are the planning module of MARK XL, a personal AI assist
 Your job: break any user goal into a sequence of steps using ONLY the tools listed below.
 
 ABSOLUTE RULES:
-- NEVER use generated_code or write Python scripts. It does not exist.
-- NEVER reference previous step results in parameters. Every step is independent.
-- Use web_search for ANY information retrieval, research, or current data.
+- Steps are written independently; the executor MAY auto-inject previous step outputs into file_controller.write content. You do NOT need to reference them.
+- Use web_search for research, current data, and information retrieval.
 - Use file_controller to save content to disk.
-- Max 5 steps. Use the minimum steps needed.
+- Use generated_code ONLY for tasks that no other tool can handle.
+- Max 6 steps. Use the minimum steps needed.
+- WRITE 'description' FIELDS IN SPANISH (the user's language).
+- Tool names and parameter KEYS stay in English, but parameter VALUES should match the user's language.
 
 AVAILABLE TOOLS AND THEIR PARAMETERS:
 
@@ -116,6 +118,9 @@ dev_agent
   description: string (required)
   language: string (optional)
 
+generated_code
+  description: string (required) — what the generated code should accomplish
+
 OUTPUT — return ONLY valid JSON, no markdown, no explanation, no code blocks:
 {
   "goal": "...",
@@ -132,6 +137,67 @@ OUTPUT — return ONLY valid JSON, no markdown, no explanation, no code blocks:
 """
 
 
+MAX_STEPS = 6
+_VALID_TOOLS = {
+    "open_app", "web_search", "game_updater", "browser_control",
+    "file_controller", "computer_settings", "computer_control",
+    "screen_process", "send_message", "reminder", "desktop_control",
+    "youtube_video", "weather_report", "flight_finder", "code_helper",
+    "dev_agent", "generated_code", "save_memory",
+}
+
+
+def _extract_json(text: str) -> str:
+    """Extrae el JSON entre la primera { y la ultima }."""
+    if not text:
+        return ""
+    text = re.sub(r"```(?:json)?", "", text).strip().rstrip("`").strip()
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        return text[start:end + 1]
+    return text
+
+
+def _validate_plan(plan, goal: str) -> dict:
+    """Valida y normaliza un plan. Lanza ValueError si es invalido."""
+    if not isinstance(plan, dict):
+        raise ValueError(f"Plan no es dict: {type(plan).__name__}")
+    if "steps" not in plan or not isinstance(plan["steps"], list):
+        raise ValueError("Plan sin 'steps' o 'steps' no es lista")
+
+    valid_steps = []
+    for step in plan["steps"]:
+        if not isinstance(step, dict):
+            print(f"[Planner] ⚠️ Paso no-dict ignorado: {step}")
+            continue
+        if "tool" not in step:
+            print(f"[Planner] ⚠️ Paso sin 'tool' ignorado: {step}")
+            continue
+        if step["tool"] not in _VALID_TOOLS:
+            print(f"[Planner] ⚠️ Tool desconocida '{step['tool']}' — reemplazada por web_search")
+            step["tool"]       = "web_search"
+            step["parameters"] = {"query": step.get("description", goal)[:200]}
+        # Asegurar campo description
+        if "description" not in step:
+            step["description"] = step.get("tool", "step")
+        # Asegurar campo parameters
+        if "parameters" not in step or not isinstance(step["parameters"], dict):
+            step["parameters"] = {}
+        valid_steps.append(step)
+
+    if not valid_steps:
+        raise ValueError("Ningun paso valido en el plan")
+
+    if len(valid_steps) > MAX_STEPS:
+        print(f"[Planner] ⚠️ Plan con {len(valid_steps)} pasos, truncado a {MAX_STEPS}")
+        valid_steps = valid_steps[:MAX_STEPS]
+
+    plan["steps"] = valid_steps
+    plan.setdefault("goal", goal)
+    return plan
+
+
 def create_plan(goal: str, context: str = "") -> dict:
     user_input = f"Goal: {goal}"
     if context:
@@ -139,50 +205,37 @@ def create_plan(goal: str, context: str = "") -> dict:
 
     try:
         text = call_llm_text(user_input, system=PLANNER_PROMPT)
-        text = re.sub(r"```(?:json)?", "", text).strip().rstrip("`").strip()
-
+        text = _extract_json(text)
         plan = json.loads(text)
-        if "steps" not in plan or not isinstance(plan["steps"], list):
-            raise ValueError("Invalid plan structure")
+        plan = _validate_plan(plan, goal)
 
-        for step in plan["steps"]:
-            if step.get("tool") == "generated_code":
-                print(f"[Planner] ⚠️ generated_code in step {step.get('step')} — replacing with web_search")
-                step["tool"]       = "web_search"
-                step["parameters"] = {"query": step.get("description", goal)[:200]}
-
-        print(f"[Planner] ✅ Plan: {len(plan['steps'])} steps")
+        print(f"[Planner] Plan: {len(plan['steps'])} pasos")
         for s in plan["steps"]:
-            print(f"  Step {s['step']}: [{s['tool']}] {s['description']}")
+            print(f"  Paso {s.get('step', '?')}: [{s['tool']}] {s['description'][:60]}")
         return plan
 
     except json.JSONDecodeError as e:
-        print(f"[Planner] ⚠️ JSON parse failed: {e}")
+        print(f"[Planner] JSON parse failed: {e}")
         return _fallback_plan(goal)
     except Exception as e:
-        print(f"[Planner] ⚠️ Planning failed: {e}")
+        print(f"[Planner] Planning failed: {e}")
         return _fallback_plan(goal)
 
 
 def _fallback_plan(goal: str) -> dict:
-    print("[Planner] 🔄 Fallback plan")
+    """Devuelve un plan VACIO para que el executor lo rechace limpiamente."""
+    print("[Planner] Fallback: no se pudo generar plan")
     return {
         "goal":  goal,
-        "steps": [
-            {
-                "step":        1,
-                "tool":        "web_search",
-                "description": f"Search for: {goal}",
-                "parameters":  {"query": goal},
-                "critical":    True,
-            }
-        ],
+        "steps": [],
+        "_is_fallback": True,
     }
 
 
 def replan(goal: str, completed_steps: list, failed_step: dict, error: str) -> dict:
     completed_summary = "\n".join(
-        f"  - Step {s['step']} ({s['tool']}): DONE" for s in completed_steps
+        f"  - Paso {s.get('step', '?')} ({s.get('tool', '?')}): HECHO"
+        for s in completed_steps
     )
     prompt = f"""Goal: {goal}
 
@@ -196,16 +249,11 @@ Create a REVISED plan for the remaining work only. Do not repeat completed steps
 
     try:
         text = call_llm_text(prompt, system=PLANNER_PROMPT)
-        text = re.sub(r"```(?:json)?", "", text).strip().rstrip("`").strip()
+        text = _extract_json(text)
         plan = json.loads(text)
-
-        for step in plan.get("steps", []):
-            if step.get("tool") == "generated_code":
-                step["tool"]       = "web_search"
-                step["parameters"] = {"query": step.get("description", goal)[:200]}
-
-        print(f"[Planner] 🔄 Revised plan: {len(plan['steps'])} steps")
+        plan = _validate_plan(plan, goal)
+        print(f"[Planner] Plan revisado: {len(plan['steps'])} pasos")
         return plan
     except Exception as e:
-        print(f"[Planner] ⚠️ Replan failed: {e}")
+        print(f"[Planner] Replan failed: {e}")
         return _fallback_plan(goal)

@@ -104,6 +104,39 @@ def _safe_trash(target: Path) -> str:
     return f"Moved to Trash: {target.name}"
 
 
+def _ensure_str(content) -> str:
+    """Convierte cualquier tipo a string. Dicts -> JSON, listas -> lineas."""
+    if isinstance(content, str):
+        return content
+    if content is None:
+        return ""
+    if isinstance(content, list):
+        return "\n".join(str(x) for x in content)
+    try:
+        import json
+        return json.dumps(content, ensure_ascii=False, indent=2)
+    except Exception:
+        return str(content)
+
+
+def _is_binary(path: Path, check_bytes: int = 1024) -> bool:
+    """Detecta si un archivo parece binario (contiene bytes nulos)."""
+    try:
+        with open(path, "rb") as f:
+            chunk = f.read(check_bytes)
+        return b"\x00" in chunk
+    except Exception:
+        return False
+
+
+def _check_inside_base(target: Path, base: Path) -> bool:
+    """Verifica que target este DENTRO de base (evita path traversal)."""
+    try:
+        target.resolve().relative_to(base.resolve())
+        return True
+    except ValueError:
+        return False
+
 def list_files(path: str = "desktop", show_hidden: bool = False) -> str:
     try:
         target = _resolve_path(path)
@@ -140,12 +173,13 @@ def create_file(path: str, name: str = "", content: str = "") -> str:
         base   = _resolve_path(path)
         target = (base / name) if name else base
         if not _is_safe_path(target):
-            return f"Access denied: {target}"
+            return f"Acceso denegado: {target}"
+        content = _ensure_str(content)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
-        return f"File created: {target.name}"
+        return f"Archivo creado: {target.name}"
     except Exception as e:
-        return f"Could not create file: {e}"
+        return f"No pude crear el archivo: {e}"
 
 
 def create_folder(path: str, name: str = "") -> str:
@@ -165,24 +199,28 @@ def delete_file(path: str, name: str = "") -> str:
         base   = _resolve_path(path)
         target = (base / name) if name else base
         if not _is_safe_path(target):
-            return f"Access denied: {target}"
+            return f"Acceso denegado: {target}"
         if not target.exists():
-            return f"Not found: {target.name}"
+            return f"No encontrado: {target.name}"
 
-        # Güvenli dizin kontrolü — kritik kullanıcı klasörlerini koru
+        # Proteccion 1: directorios estandar
         protected = {
             _get_desktop(), _get_downloads(), _get_documents(),
             _get_pictures(), _get_music(), _get_videos(), Path.home()
         }
         if target.resolve() in {p.resolve() for p in protected}:
-            return f"Protected directory, cannot delete: {target.name}"
+            return f"Directorio protegido, no se puede borrar: {target.name}"
+
+        # Proteccion 2: no permitir escapar del base con ../
+        if name and not _check_inside_base(target, base):
+            return f"Ruta fuera de {base.name}/, denegado: {name}"
 
         return _safe_trash(target)
 
     except PermissionError:
-        return f"Permission denied: {path}"
+        return f"Permiso denegado: {path}"
     except Exception as e:
-        return f"Could not delete: {e}"
+        return f"No pude borrar: {e}"
 
 
 def move_file(path: str, name: str = "", destination: str = "") -> str:
@@ -269,19 +307,31 @@ def read_file(path: str, name: str = "", max_chars: int = 4000) -> str:
         base   = _resolve_path(path)
         target = (base / name) if name else base
         if not _is_safe_path(target):
-            return f"Access denied: {target}"
+            return f"Acceso denegado: {target}"
         if not target.exists():
-            return f"File not found: {target.name}"
+            return f"Archivo no encontrado: {target.name}"
         if not target.is_file():
-            return f"Not a file: {target.name}"
+            return f"No es un archivo: {target.name}"
 
-        content = target.read_text(encoding="utf-8", errors="ignore")
+        # Rechazar binarios
+        if _is_binary(target):
+            return f"No puedo leer un archivo binario: {target.name}"
+
+        # Intentar UTF-8, luego latin-1
+        try:
+            content = target.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            try:
+                content = target.read_text(encoding="latin-1")
+            except Exception as e:
+                return f"No pude decodificar el archivo: {e}"
+
         if len(content) > max_chars:
-            content = content[:max_chars] + f"\n\n[Truncated — {len(content)} total chars]"
+            content = content[:max_chars] + f"\n\n[Truncado — {len(content)} caracteres totales]"
         return content
 
     except Exception as e:
-        return f"Could not read file: {e}"
+        return f"No pude leer el archivo: {e}"
 
 
 def write_file(path: str, name: str = "", content: str = "",
@@ -290,15 +340,16 @@ def write_file(path: str, name: str = "", content: str = "",
         base   = _resolve_path(path)
         target = (base / name) if name else base
         if not _is_safe_path(target):
-            return f"Access denied: {target}"
+            return f"Acceso denegado: {target}"
+        content = _ensure_str(content)
         target.parent.mkdir(parents=True, exist_ok=True)
         mode = "a" if append else "w"
         with open(target, mode, encoding="utf-8") as f:
             f.write(content)
-        action = "Appended to" if append else "Written to"
+        action = "Anadido a" if append else "Escrito en"
         return f"{action}: {target.name}"
     except Exception as e:
-        return f"Could not write file: {e}"
+        return f"No pude escribir el archivo: {e}"
 
 
 def find_files(name: str = "", extension: str = "",

@@ -64,6 +64,7 @@ def _run_generated_code(description: str, speak: Callable | None = None) -> str:
     )
     prompt = f"Write Python code to accomplish this task:\n\n{description}"
 
+    tmp_path = None
     try:
         code = call_llm_text(prompt, system=system)
         code = re.sub(r"```(?:python)?", "", code).strip().rstrip("`").strip()
@@ -74,21 +75,18 @@ def _run_generated_code(description: str, speak: Callable | None = None) -> str:
             f.write(code)
             tmp_path = f.name
 
-        print(f"[Executor] 🐍 Running generated code: {tmp_path}")
+        print(f"[Executor] Running generated code: {tmp_path}")
 
+        # cwd en tempfile para no contaminar home
         result = subprocess.run(
             [sys.executable, tmp_path],
             capture_output=True, text=True,
-            timeout=120, cwd=str(Path.home()),
+            timeout=120, cwd=tempfile.gettempdir(),
         )
 
-        try:
-            os.unlink(tmp_path)
-        except Exception:
-            pass
-
-        output = result.stdout.strip()
-        error  = result.stderr.strip()
+        # Truncar output para evitar llenar RAM
+        output = result.stdout.strip()[:10000]
+        error  = result.stderr.strip()[:2000]
 
         if result.returncode == 0 and output:
             return output
@@ -104,6 +102,13 @@ def _run_generated_code(description: str, speak: Callable | None = None) -> str:
         raise
     except Exception as e:
         raise RuntimeError(f"Generated code failed: {e}")
+    finally:
+        # Limpieza garantizada del archivo temporal
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -121,27 +126,42 @@ def _detect_language(text: str) -> str:
         return "English"
 
 
+_LANG_CACHE: dict[str, str] = {}
+
+
+def _get_target_language(goal: str) -> str:
+    """Cache de deteccion de idioma para no llamar al LLM 2 veces."""
+    if not goal:
+        return "English"
+    key = goal[:100]
+    if key in _LANG_CACHE:
+        return _LANG_CACHE[key]
+    lang = _detect_language(goal)
+    _LANG_CACHE[key] = lang
+    return lang
+
+
 def _translate_to_goal_language(content: str, goal: str) -> str:
     if not goal:
         return content
     try:
-        target_lang = _detect_language(goal)
-        print(f"[Executor] 🌐 Translating to: {target_lang}")
+        target_lang = _get_target_language(goal)
+        print(f"[Executor] Traduciendo a: {target_lang}")
         prompt = (
-            f"You are a professional translator. "
-            f"Translate the following text into {target_lang}.\n"
-            f"IMPORTANT:\n"
-            f"- Translate EVERYTHING, leave nothing in English\n"
-            f"- Keep all facts, numbers, and data intact\n"
-            f"- Keep the structure and formatting\n"
-            f"- Output ONLY the translated text, nothing else\n\n"
-            f"Text to translate:\n{content[:4000]}"
+            f"Eres un traductor profesional. "
+            f"Traduce el siguiente texto a {target_lang}.\n"
+            f"IMPORTANTE:\n"
+            f"- Traduce TODO, no dejes nada sin traducir\n"
+            f"- Manten hechos, numeros y datos intactos\n"
+            f"- Manten la estructura y formato\n"
+            f"- Devuelve SOLO el texto traducido, nada mas\n\n"
+            f"Texto a traducir:\n{content[:4000]}"
         )
         translated = call_llm_text(prompt)
-        print(f"[Executor] ✅ Translation done ({target_lang})")
+        print(f"[Executor] Traduccion lista ({target_lang})")
         return translated
     except Exception as e:
-        print(f"[Executor] ⚠️ Translation failed: {e}")
+        print(f"[Executor] Traduccion fallo: {e}")
         return content
 
 
@@ -152,15 +172,23 @@ def _inject_context(params: dict, tool: str, step_results: dict, goal: str = "")
     if tool == "file_controller" and params.get("action") in ("write", "create_file"):
         content = params.get("content", "")
         if not content or len(content) < 50:
-            all_results = [
-                v for v in step_results.values()
-                if v and len(v) > 100 and v not in ("Done.", "Completed.")
-            ]
-            if all_results:
-                combined   = "\n\n---\n\n".join(all_results)
-                translated = _translate_to_goal_language(combined, goal)
-                params["content"] = translated
-                print("[Executor] 💉 Injected + translated content")
+            # Solo el ULTIMO resultado sustancial (no concatenar todos)
+            last = None
+            for step_num in sorted(step_results.keys(), reverse=True):
+                v = step_results[step_num]
+                if v and len(v) > 100 and v not in ("Done.", "Completed.", "Ejecutado sin output."):
+                    last = v
+                    break
+
+            if last:
+                # No traducir si parece JSON/codigo
+                if last.strip().startswith(("{", "[", "```", "using ", "import ", "def ")):
+                    params["content"] = last
+                    print("[Executor] Contenido inyectado (sin traducir)")
+                else:
+                    translated = _translate_to_goal_language(last, goal)
+                    params["content"] = translated
+                    print("[Executor] Contenido inyectado + traducido")
     return params
 
 
@@ -265,11 +293,15 @@ class AgentExecutor:
         completed_steps: list = []
         step_results:    dict = {}
         plan = create_plan(goal)
+        if not isinstance(plan, dict):
+            msg = "No pude crear un plan valido, senor."
+            if speak: speak(msg)
+            return msg
 
         while True:
             steps = plan.get("steps", [])
             if not steps:
-                msg = "I couldn't create a valid plan for this task, sir."
+                msg = "No pude crear un plan valido para esta tarea, senor."
                 if speak: speak(msg)
                 return msg
 
@@ -363,7 +395,7 @@ class AgentExecutor:
                     break
 
             if success:
-                return self._summarize(goal, completed_steps, speak)
+                return self._summarize(goal, completed_steps, speak, cancel_flag)
 
             if replan_attempts >= self.MAX_REPLAN_ATTEMPTS:
                 msg = f"Task failed after {replan_attempts} replan attempts, sir."
@@ -374,14 +406,20 @@ class AgentExecutor:
             replan_attempts += 1
             plan = replan(goal, completed_steps, failed_step, failed_error)
 
-    def _summarize(self, goal: str, completed_steps: list, speak: Callable | None) -> str:
-        fallback  = f"All done, sir. Completed {len(completed_steps)} steps for: {goal[:60]}."
+    def _summarize(self, goal: str, completed_steps: list,
+                    speak: Callable | None,
+                    cancel_flag=None) -> str:
+        fallback = f"Todo listo, senor. Completados {len(completed_steps)} pasos."
+        if cancel_flag and cancel_flag.is_set():
+            if speak: speak(fallback)
+            return fallback
+
         steps_str = "\n".join(f"- {s.get('description', '')}" for s in completed_steps)
         prompt    = (
-            f'User goal: "{goal}"\n'
-            f"Completed steps:\n{steps_str}\n\n"
-            "Write a single natural sentence summarising what was accomplished. "
-            "Address the user as 'sir'. Be direct and positive."
+            f'Objetivo del usuario: "{goal}"\n'
+            f"Pasos completados:\n{steps_str}\n\n"
+            "Escribe UNA frase natural en ESPANOL resumiendo lo que se ha hecho. "
+            "Trata al usuario de 'senor'. Se directo y positivo."
         )
         try:
             summary = call_llm_text(prompt)

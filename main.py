@@ -2,25 +2,26 @@
 MARK XL — Local LLM Edition
 STT (Whisper / Vosk)  +  Ollama LLM  +  TTS (EdgeTTS / Kokoro / ElevenLabs)
 All Gemini / Google-AI dependencies removed.
+
+MEJORAS APLICADAS:
+  #1  Race condition micrófono (lectura atómica de speaking+muted)
+  #2  Resampleo de audio seguro (scipy/librosa/fallback, nunca omite)
+  #3  Historial por tokens (no por número de mensajes)
+  #4  Barge-in (interrumpir a JARVIS mientras habla)
+  #5  VAD Inteligente con Silero (modelo neuronal)
+  #6  Historial persistente entre sesiones (conversation.json)
 """
 # ── Silence verbose logs + block heavy unused backends ─────────────────────
 import os as _os
-_os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL",  "3")   # TensorFlow C++ noise
-_os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")   # oneDNN banner
+_os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL",  "3")
+_os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
 _os.environ.setdefault("GRPC_VERBOSITY",         "ERROR")
-# USE_TF=0 prevents transformers from importing TensorFlow (saves 4-8 s).
-# We intentionally do NOT set USE_TORCH or USE_JAX — forcing those values
-# breaks transformers' lazy-loader on some versions (AutoModel disappears
-# from the namespace).  Let transformers auto-detect the available backends.
 _os.environ.setdefault("USE_TF",                 "0")
 _os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-# Offline mode — use cached models, no HuggingFace network calls on startup.
-# On first run the model isn't cached yet; tts.py / stt.py detect this and
-# temporarily clear these flags to allow the one-time download, then they
-# stay in effect for every subsequent launch (fully offline).
 _os.environ.setdefault("HF_HUB_OFFLINE",      "1")
 _os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 _os.environ.setdefault("HF_DATASETS_OFFLINE",  "1")
+
 import warnings as _warnings
 _warnings.filterwarnings("ignore", category=UserWarning)
 _warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -28,7 +29,6 @@ _warnings.filterwarnings("ignore", category=FutureWarning)
 # ───────────────────────────────────────────────────────────────────────────
 
 # ── Bootstrap: auto-install base UI packages before anything else ──────────
-# Uses only stdlib so it works even on a completely fresh Python install.
 import importlib.util as _ilu
 import subprocess      as _sp
 import sys             as _sys
@@ -50,7 +50,6 @@ def _bootstrap() -> None:
     print("[MARK XL] This happens only once.\n")
     _sp.run([_sys.executable, "-m", "pip", "install", *need], check=True)
     print("\n[MARK XL] Base packages ready — restarting…\n")
-    # Replace current process with a fresh one (picks up newly installed packages)
     _os.execv(_sys.executable, [_sys.executable] + _sys.argv)
 
 _bootstrap()
@@ -62,6 +61,7 @@ import re
 import sys
 import threading
 import traceback
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -91,9 +91,322 @@ from actions.computer_control  import computer_control
 from actions.game_updater      import game_updater
 
 
-# ---------------------------------------------------------------------------
-# Paths
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
+# FIX #2: Audio resampling helper + FIX #3: Token estimation
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _estimate_tokens(text: str) -> int:
+    """Estima tokens de forma conservadora. ~3 chars/token para español."""
+    if not text:
+        return 0
+    return max(1, int(len(text) / 3.0))
+
+
+
+def _normalize_tool_args(tool_name: str, args: dict) -> dict:
+    """Corrige nombres de parámetros que los LLM suelen meter mal."""
+    if not isinstance(args, dict):
+        return {}
+
+    args = dict(args)
+
+    # ── open_app: app / name / application / program → app_name
+    if tool_name == "open_app":
+        for alt in ("app", "name", "application", "program", "appname", "appName"):
+            if alt in args and "app_name" not in args:
+                args["app_name"] = args.pop(alt)
+        args.pop("action", None)
+
+    # ── code_helper: filepath → file_path, content → code
+    if tool_name == "code_helper":
+        if "filepath" in args and "file_path" not in args:
+            args["file_path"] = args.pop("filepath")
+        if "filename" in args and "output_path" not in args:
+            args["output_path"] = args.pop("filename")
+        if "content" in args and "code" not in args:
+            args["code"] = args.pop("content")
+        if "instruction" in args and "description" not in args:
+            args["description"] = args.pop("instruction")
+
+    # ── web_search: q → query
+    if tool_name == "web_search":
+        if "q" in args and "query" not in args:
+            args["query"] = args.pop("q")
+
+    # ── reminder: when → time
+    if tool_name == "reminder":
+        if "when" in args and "time" not in args:
+            args["time"] = args.pop("when")
+
+    # ── weather_report: location → city
+    if tool_name == "weather_report":
+        if "location" in args and "city" not in args:
+            args["city"] = args.pop("location")
+
+    # ── youtube_video: video_query → query
+    if tool_name == "youtube_video":
+        if "video_query" in args and "query" not in args:
+            args["query"] = args.pop("video_query")
+
+    return args
+
+
+
+def _parse_kv_args(text: str) -> dict:
+    """Parsea key=value, key="value" y key='value' de un texto."""
+    if not text:
+        return {}
+    args = {}
+    text_flat = text.replace("\n", " ").replace("\r", " ")
+
+    # Base: key=value sin comillas
+    for m in re.finditer(r'(\w+)\s*=\s*(\S+)', text_flat):
+        val = m.group(2).rstrip(",;")
+        if val:
+            args[m.group(1).lower()] = val
+
+    # Override: key="value"
+    for m in re.finditer(r'(\w+)\s*=\s*"([^"]*)"', text_flat):
+        args[m.group(1).lower()] = m.group(2)
+
+    # Override: key='value'
+    for m in re.finditer(r"(\w+)\s*=\s*'([^']*)'", text_flat):
+        args[m.group(1).lower()] = m.group(2)
+
+    # Conversion de tipos
+    for key, val in list(args.items()):
+        if isinstance(val, str):
+            vl = val.lower()
+            if vl == "true":
+                args[key] = True
+            elif vl == "false":
+                args[key] = False
+            elif vl.isdigit():
+                args[key] = int(val)
+            elif re.match(r"^-?\d+\.\d+$", val):
+                args[key] = float(val)
+
+    return args
+
+
+def _extract_and_clean_text_tool_calls(content: str) -> tuple:
+    """
+    Detecta tool calls escritas como texto y las limpia del contenido.
+    Retorna (tool_calls, cleaned_content).
+    """
+    if not content:
+        return [], content
+
+    valid = {d["name"] for d in TOOL_DECLARATIONS}
+    tool_calls = []
+    seen = set()
+    cleaned = content
+
+    def _add(tool_name, args):
+        if not args:
+            return
+        key = (tool_name, tuple(sorted(args.items(), key=lambda x: x[0])))
+        if key not in seen:
+            seen.add(key)
+            tool_calls.append({"function": {"name": tool_name, "arguments": args}})
+
+    # Patron 1: [tool_name]\nkey=value\n...
+    p1 = re.compile(
+        r"\[\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\]\s*\n"
+        r"((?:\s*[a-zA-Z_][a-zA-Z0-9_]*\s*=\s*[^\n]+\n?)+)"
+    )
+    def _c1(m):
+        name = m.group(1).lower()
+        if name not in valid:
+            return m.group(0)
+        args = _parse_kv_args(m.group(2))
+        if not args:
+            return m.group(0)
+        _add(name, args)
+        return ""
+    cleaned = p1.sub(_c1, cleaned)
+
+    # Patron 2: [llamada (estructurada) a TOOL con key="value", ...]
+    p2 = re.compile(
+        r"\[\s*llamada\s+(?:estructurada\s+)?a\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+con\s+([^\]]+)\]",
+        re.DOTALL,
+    )
+    def _c2(m):
+        name = m.group(1).lower()
+        if name not in valid:
+            return m.group(0)
+        args = _parse_kv_args(m.group(2))
+        if not args:
+            return m.group(0)
+        _add(name, args)
+        return ""
+    cleaned = p2.sub(_c2, cleaned)
+
+    # Patron 3: [TOOL con key="value", ...]
+    p3 = re.compile(
+        r"\[\s*([a-zA-Z_][a-zA-Z0-9_]*)\s+con\s+([^\]]+)\]",
+        re.DOTALL,
+    )
+    def _c3(m):
+        name = m.group(1).lower()
+        if name not in valid:
+            return m.group(0)
+        args = _parse_kv_args(m.group(2))
+        if not args:
+            return m.group(0)
+        _add(name, args)
+        return ""
+    cleaned = p3.sub(_c3, cleaned)
+
+    # Patron 4: [tool] seguido de <parameter=key>value</parameter>
+    p4 = re.compile(
+        r"\[\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\]\s*\n?"
+        r"((?:\s*<parameter=\w+>.*?</parameter>\s*\n?)+)",
+        re.DOTALL,
+    )
+    def _c4(m):
+        name = m.group(1).lower()
+        if name not in valid:
+            return m.group(0)
+        params_text = m.group(2)
+        args = {}
+        for pm in re.finditer(r"<parameter=(\w+)>\s*(.*?)\s*</parameter>", params_text, re.DOTALL):
+            key = pm.group(1).lower()
+            val = pm.group(2).strip()
+            if val.lower() == "true":
+                args[key] = True
+            elif val.lower() == "false":
+                args[key] = False
+            elif val.isdigit():
+                args[key] = int(val)
+            else:
+                args[key] = val
+        if not args:
+            return m.group(0)
+        _add(name, args)
+        return ""
+    cleaned = p4.sub(_c4, cleaned)
+
+    # Patron 5: tool(key="value") o tool(key='value')
+    p5 = re.compile(
+        r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\(\s*([^)]+?)\s*\)"
+    )
+    def _c5(m):
+        name = m.group(1).lower()
+        if name not in valid:
+            return m.group(0)
+        args = _parse_kv_args(m.group(2))
+        if not args:
+            return m.group(0)
+        _add(name, args)
+        return ""
+    cleaned = p5.sub(_c5, cleaned)
+
+    # Patron 6: JSON puro {"name": "tool", "arguments": {...}}
+    p6 = re.compile(
+        r'\{\s*"name"\s*:\s*"([a-zA-Z_][a-zA-Z0-9_]*)"\s*,'
+        r'\s*"arguments"\s*:\s*(\{(?:[^{}]|\{[^{}]*\})*\})\s*\}',
+        re.DOTALL,
+    )
+    def _c6(m):
+        name = m.group(1).lower()
+        if name not in valid:
+            return m.group(0)
+        try:
+            import json as _j
+            args = _j.loads(m.group(2))
+        except Exception:
+            return m.group(0)
+        if not isinstance(args, dict) or not args:
+            return m.group(0)
+        _add(name, args)
+        return ""
+    cleaned = p6.sub(_c6, cleaned)
+
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+
+    return tool_calls, cleaned
+
+
+
+def _strip_internal_directives(content: str) -> str:
+    """Elimina instrucciones internas que el LLM copia en su respuesta."""
+    if not content:
+        return content
+    import re
+    # Patrones de instrucciones internas que se cuelan
+    patterns = [
+        r"\[\s*(?:TERMINA\s+)?INSTRUCCI[OÓ]N\s+CR[IÍ]TICA\s*:?[^\]]*\]",
+        r"\[\s*(?:TERMINA\s+)?INSTRUCTION\s+CRITICAL?\s*:?[^\]]*\]",
+        r"\[\s*INSTRUCCION\s+CRITICA\s*:?[^\]]*\]",
+        r"\[\s*INSTRUCTION\s*:?[^\]]*\]",
+        r"\[\s*INSTRUCCION\s*:?[^\]]*\]",
+    ]
+    for pat in patterns:
+        content = re.sub(pat, "", content, flags=re.IGNORECASE)
+    # Colapsar lineas vacias multiples
+    content = re.sub(r"\n{3,}", "\n\n", content).strip()
+    return content
+
+
+def _extract_code_from_response(content: str) -> tuple[str, str] | None:
+    """Extrae bloque de codigo de una respuesta de chat (fallback)."""
+    if not content:
+        return None
+
+    match = re.search(r"```([a-zA-Z#]+)?\s*\n(.*?)```", content, re.DOTALL)
+    if not match:
+        return None
+
+    lang = (match.group(1) or "").strip().lower()
+    code = match.group(2).strip()
+
+    if len(code) < 50:
+        return None
+
+    valid = {"python", "py", "csharp", "cs", "c#", "javascript", "js",
+             "typescript", "ts", "html", "css", "shader"}
+    if lang not in valid:
+        if "using UnityEngine" in code or "MonoBehaviour" in code:
+            lang = "csharp"
+        elif "def " in code and "import " in code:
+            lang = "python"
+        elif "function " in code or "const " in code:
+            lang = "javascript"
+        else:
+            lang = "python"
+
+    return code, lang
+
+def _resample_audio(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
+    """Convierte audio de orig_sr a target_sr de forma segura. NUNCA omite."""
+    if orig_sr == target_sr:
+        return audio
+    try:
+        from scipy import signal
+        num_samples = int(len(audio) * target_sr / orig_sr)
+        if num_samples < 1:
+            num_samples = 1
+        resampled, _ = signal.resample(audio, num_samples)
+        return resampled.astype(np.float32)
+    except ImportError:
+        pass
+    try:
+        import librosa
+        return librosa.resample(audio, orig_sr=orig_sr, target_sr=target_sr).astype(np.float32)
+    except ImportError:
+        pass
+    target_len = int(len(audio) * target_sr / orig_sr)
+    if target_len < 1:
+        target_len = 1
+    old_t = np.linspace(0, len(audio) - 1, num=len(audio), dtype=np.float32)
+    new_t = np.linspace(0, len(audio) - 1, num=target_len, dtype=np.float32)
+    return np.interp(new_t, old_t, audio).astype(np.float32)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FIX #6: Historial persistente entre sesiones
+# ═══════════════════════════════════════════════════════════════════════════
 
 def _get_base_dir() -> Path:
     if getattr(sys, "frozen", False):
@@ -104,14 +417,49 @@ def _get_base_dir() -> Path:
 BASE_DIR        = _get_base_dir()
 API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
 PROMPT_PATH     = BASE_DIR / "core" / "prompt.txt"
+CONVERSATION_PATH = BASE_DIR / "memory" / "conversation.json"
+
+
+def _load_conversation() -> list[dict]:
+    """Carga la conversación guardada, o devuelve lista vacía."""
+    try:
+        if CONVERSATION_PATH.exists():
+            with open(CONVERSATION_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception as e:
+        print(f"[Memory] ⚠️ No se pudo cargar conversación: {e}")
+    return []
+
+
+def _save_conversation(conversation: list[dict]) -> None:
+    """Guarda la conversación en disco. Solo los últimos 20 mensajes."""
+    try:
+        CONVERSATION_PATH.parent.mkdir(parents=True, exist_ok=True)
+        to_save = conversation[-20:] if len(conversation) > 20 else conversation
+        with open(CONVERSATION_PATH, "w", encoding="utf-8") as f:
+            json.dump(to_save, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[Memory] ⚠️ No se pudo guardar conversación: {e}")
+
 
 SAMPLE_RATE_IN = 16_000
+# Palabras que significan "cállate y escucha", NO "ciérrate"
+_STOP_WORDS = {
+    "para", "parar", "stop", "detente", "detén", "cállate",
+    "calla", "silencio", "basta", "ya", "espera", "aguanta",
+    "quiet", "shut up", "hold on", "wait", "escucha",
+}
+# Palabras que significan "cállate y escucha", NO "ciérrate"
+_STOP_WORDS = {
+    "para", "parar", "stop", "detente", "detén", "cállate",
+    "calla", "silencio", "basta", "ya", "espera", "aguanta",
+    "quiet", "shut up", "hold on", "wait", "escucha",
+}
 BLOCK_SIZE     = 1_024
 CHANNELS       = 1
 
 # ---------------------------------------------------------------------------
-# Tool declarations (Gemini format kept for readability;
-# converted to OpenAI/Ollama format by _to_ollama_tools())
+# Tool declarations
 # ---------------------------------------------------------------------------
 
 TOOL_DECLARATIONS = [
@@ -454,12 +802,16 @@ TOOL_DECLARATIONS = [
             "Save a personal fact about the user to permanent long-term memory. "
             "MANDATORY: call this IMMEDIATELY (without asking) whenever the user states or corrects: "
             "their name, age, city, job, school, language, nationality, a preference, a goal, or a relationship. "
+            "ALSO save COMMUNICATION PREFERENCES: how the user likes to interact. "
             "Examples: "
             "'my name is Fatih' → (identity, name, Fatih) | "
             "'not Travis, Fatih' → (identity, name, Fatih) | "
             "'I am 22' → (identity, age, 22) | "
             "'I live in Ankara' → (identity, city, Ankara) | "
-            "'I prefer dark mode' → (preferences, ui_theme, dark mode). "
+            "'I prefer dark mode' → (preferences, ui_theme, dark mode) | "
+            "'I like short answers' → (preferences, communication_style, concise) | "
+            "'Explain things to me' → (preferences, communication_style, explanatory) | "
+            "'I'm working on a Unity VR game' → (projects, unity_vr, active). "
             "Call SILENTLY alongside your verbal reply — never announce that you are saving."
         ),
         "parameters": {
@@ -469,7 +821,7 @@ TOOL_DECLARATIONS = [
                     "type": "STRING",
                     "description": (
                         "identity (name/age/city/job/school/nationality) | "
-                        "preferences (likes/dislikes/habits) | "
+                        "preferences (likes/dislikes/habits/communication_style) | "
                         "projects (active work/goals) | "
                         "relationships (people in their life) | "
                         "wishes (future plans/wants) | "
@@ -484,10 +836,6 @@ TOOL_DECLARATIONS = [
     },
 ]
 
-
-# ---------------------------------------------------------------------------
-# Convert Gemini-style declarations to OpenAI/Ollama format
-# ---------------------------------------------------------------------------
 
 _TYPE_MAP = {
     "OBJECT": "object", "STRING": "string", "ARRAY": "array",
@@ -536,10 +884,6 @@ def _to_ollama_tools(decls: list) -> list:
 OLLAMA_TOOLS = _to_ollama_tools(TOOL_DECLARATIONS)
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
 def _load_config() -> dict:
     try:
         with open(API_CONFIG_PATH, encoding="utf-8") as f:
@@ -559,64 +903,224 @@ def _load_system_prompt() -> str:
         )
 
 
-# ---------------------------------------------------------------------------
-# Voice Activity Detection (used for Whisper listen loop)
-# ---------------------------------------------------------------------------
+# FIX #2: _prepare_audio_chunk reescrito con resampleo SEGURO
 
-class _VADBuffer:
-    """Energy-based VAD: buffers audio until end of utterance."""
+def _prepare_audio_chunk(chunk: np.ndarray, source_rate: int = SAMPLE_RATE_IN) -> np.ndarray:
+    """
+    Convierte el chunk del micrófono a mono float32 @ 16 kHz para Whisper.
+    NUNCA devuelve audio sin resamplear.
+    """
+    audio = np.asarray(chunk, dtype=np.float32)
+    if audio.ndim == 2:
+        audio = np.mean(audio, axis=1)
+    elif audio.ndim > 2:
+        audio = audio.reshape(-1)
+    audio = np.asarray(audio, dtype=np.float32).reshape(-1)
+    if source_rate != SAMPLE_RATE_IN:
+        audio = _resample_audio(audio, source_rate, SAMPLE_RATE_IN)
+    return audio
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FIX #5: VAD Inteligente con Silero (reemplaza _VADBuffer)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class _SileroVAD:
+    """
+    VAD basado en modelo neuronal Silero. Mucho más preciso que RMS.
+    Distingue voz humana de ruido, música, ecos y puertazos.
+    """
     def __init__(
         self,
-        sample_rate:    int   = 16_000,
-        silence_sec:    float = 0.7,    # silence after last word → send to STT
-        speech_thresh:  float = 0.008,  # RMS above this = speech  (0.008 catches voice at 3-4 m; raise if mic picks up too much room noise)
-        silence_thresh: float = 0.004,  # RMS below this = silence (half of speech_thresh — hysteresis prevents mid-sentence cuts)
+        sample_rate: int = 16_000,
+        threshold: float = 0.5,
         min_speech_sec: float = 0.3,
         max_speech_sec: float = 30.0,
+        silence_sec: float = 0.7,
     ):
-        self._sr            = sample_rate
-        self._sil_n         = int(silence_sec * sample_rate)
-        self._speech_thresh = speech_thresh
-        self._sil_thresh    = silence_thresh
-        self._min_n         = int(min_speech_sec * sample_rate)
-        self._max_n         = int(max_speech_sec * sample_rate)
-        self._buf:          list[np.ndarray] = []
-        self._in_spch       = False
-        self._sil_cnt       = 0
+        self._sr = sample_rate
+        self._threshold = threshold
+        self._min_samples = int(min_speech_sec * sample_rate)
+        self._max_samples = int(max_speech_sec * sample_rate)
+        self._sil_samples = int(silence_sec * sample_rate)
+        self._buf: list[np.ndarray] = []
+        self._speech_samples = 0
+        self._silence_samples = 0
+        self._in_speech = False
+        self._model = None
+        self._utils = None
+        self._load_model()
+
+    def _load_model(self):
+        try:
+            import torch
+            model, utils = torch.hub.load(
+                repo_or_dir='snakers4/silero-vad',
+                model='silero_vad',
+                force_reload=False,
+                onnx=False
+            )
+            self._model = model
+            self._utils = utils
+            print("[VAD] ✅ Silero VAD cargado correctamente")
+        except Exception as e:
+            print(f"[VAD] ⚠️ No se pudo cargar Silero: {e}")
+            print("[VAD] ⚠️ Fallback a VAD por energía (RMS)")
+
+    def _get_speech_prob(self, audio: np.ndarray) -> float:
+        """Devuelve probabilidad de voz humana (0.0 - 1.0)."""
+        if self._model is None:
+            rms = float(np.sqrt(np.mean(audio ** 2)))
+            return min(1.0, rms / 0.01)
+        try:
+            import torch
+            chunk_size = 512
+            if len(audio) < chunk_size:
+                return 0.0
+            center = len(audio) // 2
+            start = max(0, center - chunk_size // 2)
+            end = min(len(audio), start + chunk_size)
+            chunk = audio[start:end]
+            if len(chunk) < chunk_size:
+                chunk = np.pad(chunk, (0, chunk_size - len(chunk)))
+            tensor = torch.from_numpy(chunk).unsqueeze(0)
+            with torch.no_grad():
+                prob = self._model(tensor, self._sr).item()
+            return prob
+        except Exception:
+            return 0.0
+
     def process(self, chunk: np.ndarray) -> np.ndarray | None:
-        """
-        Feed one audio chunk (float32 mono).
-        Returns complete utterance when speech ends, otherwise None.
+        """Procesa chunk. Devuelve audio completo al terminar frase, o None."""
+        prob = self._get_speech_prob(chunk)
+        total_samples = sum(len(c) for c in self._buf)
 
-        Uses hysteresis thresholds so the detector doesn't flicker:
-          - speech starts when RMS > speech_thresh  (0.008 = ~3-4 m range)
-          - speech ends only when RMS < silence_thresh  (0.004 = half of start)
-        The gap between the two thresholds prevents mid-sentence cuts on
-        natural pauses and quiet consonants.
-        """
-        rms     = float(np.sqrt(np.mean(chunk ** 2)))
-        total_n = sum(len(c) for c in self._buf)
-
-        if rms > self._speech_thresh:
-            self._in_spch = True
-            self._sil_cnt = 0
+        if prob > self._threshold:
+            self._in_speech = True
+            self._silence_samples = 0
             self._buf.append(chunk.copy())
-        elif self._in_spch:
+            self._speech_samples += len(chunk)
+        elif self._in_speech:
             self._buf.append(chunk.copy())
-            if rms < self._sil_thresh:
-                self._sil_cnt += len(chunk)
-
-            if self._sil_cnt >= self._sil_n or total_n >= self._max_n:
-                audio         = np.concatenate(self._buf)
-                self._buf     = []
-                self._in_spch = False
-                self._sil_cnt = 0
-                if len(audio) >= self._min_n:
+            self._silence_samples += len(chunk)
+            if (self._silence_samples >= self._sil_samples or
+                total_samples >= self._max_samples):
+                audio = np.concatenate(self._buf)
+                self._buf = []
+                self._in_speech = False
+                self._silence_samples = 0
+                self._speech_samples = 0
+                if len(audio) >= self._min_samples:
                     return audio
         return None
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# FIX #4: Barge-in detector — permite interrumpir a JARVIS mientras habla
+# ═══════════════════════════════════════════════════════════════════════════
+class _BargeInDetector:
+    """
+    Detecta voz humana mientras JARVIS habla.
+    Usa Silero VAD (neuronal) + anti-eco + cooldown.
+    Alimentado por segundo micrófono (pyaudio).
+    """
+
+    def __init__(
+        self,
+        sample_rate: int = 16_000,
+        speech_thresh: float = 0.50,
+        min_speech_sec: float = 0.5,
+        grace_period_sec: float = 1.5,
+    ):
+        self._sr = sample_rate
+        self._thresh = speech_thresh
+        self._min_samples = int(min_speech_sec * sample_rate)
+        self._grace_samples = int(grace_period_sec * sample_rate)
+        self._buffer: list[np.ndarray] = []
+        self._total_speech_samples = 0
+        self._total_heard_samples = 0
+        self._captured_audio: np.ndarray | None = None
+        self._cooldown_until: float = 0.0
+        self._vad_model = None
+        self._load_silero()
+
+    def _load_silero(self):
+        try:
+            import torch
+            model, _ = torch.hub.load(
+                repo_or_dir='snakers4/silero-vad',
+                model='silero_vad',
+                force_reload=False,
+                onnx=False
+            )
+            self._vad_model = model
+            print("[Barge-in] ✅ Silero VAD cargado (anti-eco activo)")
+        except Exception as e:
+            print(f"[Barge-in] ⚠️ Silero no disponible, usando RMS: {e}")
+
+    def _speech_prob(self, audio: np.ndarray) -> float:
+        if self._vad_model is None:
+            rms = float(np.sqrt(np.mean(audio ** 2)))
+            return min(1.0, rms / 0.01)
+        try:
+            import torch
+            chunk_size = 512
+            if len(audio) < chunk_size:
+                return 0.0
+            center = len(audio) // 2
+            start = max(0, center - chunk_size // 2)
+            end = min(len(audio), start + chunk_size)
+            chunk = audio[start:end]
+            if len(chunk) < chunk_size:
+                chunk = np.pad(chunk, (0, chunk_size - len(chunk)))
+            tensor = torch.from_numpy(chunk).unsqueeze(0)
+            with torch.no_grad():
+                prob = self._vad_model(tensor, self._sr).item()
+            return prob
+        except Exception:
+            return 0.0
+
+    def reset(self):
+        """Reinicia todo. LLAMAR cuando JARVIS empieza a hablar."""
+        self._buffer = []
+        self._total_speech_samples = 0
+        self._total_heard_samples = 0
+        self._captured_audio = None
+        self._cooldown_until = 0.0
+        if self._vad_model is not None:
+            self._vad_model.reset_states()
+
+    def process(self, chunk: np.ndarray) -> bool:
+        if time.time() < self._cooldown_until:
+            return False
+
+        self._total_heard_samples += len(chunk)
+
+        if self._total_heard_samples < self._grace_samples:
+            return False
+
+        prob = self._speech_prob(chunk)
+
+        if prob > self._thresh:
+            self._buffer.append(chunk.copy())
+            self._total_speech_samples += len(chunk)
+        else:
+            self._buffer = []
+            self._total_speech_samples = 0
+
+        if self._total_speech_samples >= self._min_samples:
+            self._captured_audio = (
+                np.concatenate(self._buffer) if self._buffer else chunk
+            )
+            self._buffer = []
+            self._total_speech_samples = 0
+            self._cooldown_until = time.time() + 2.0
+            return True
+
+        return False
+
+    def get_captured_audio(self) -> np.ndarray | None:
+        return self._captured_audio
 # ---------------------------------------------------------------------------
 # JarvisLocal
 # ---------------------------------------------------------------------------
@@ -633,12 +1137,15 @@ class JarvisLocal:
         self._config          = _load_config()
         self._stt             = None
         self._tts             = None
-        self._tts_ready       = threading.Event()   # set when TTS engine is loaded
+        self._tts_ready       = threading.Event()
         self._speaking        = False
         self._speaking_lock   = threading.Lock()
         self._text_queue:     queue.Queue = queue.Queue()
         self._tts_queue:      queue.Queue = queue.Queue()
-        self._conversation:   list[dict]  = []
+        # FIX #6: Cargar conversación persistente
+        self._conversation:   list[dict]  = _load_conversation()
+        # FIX #4: Barge-in detector
+        self._barge_in        = _BargeInDetector()
 
         self.ui.on_text_command = self._on_text_command
 
@@ -647,17 +1154,33 @@ class JarvisLocal:
     # ------------------------------------------------------------------
 
     def _build_system_prompt(self) -> str:
-        # ── ORDER MATTERS for Ollama KV prefix caching ─────────────────────
-        # Ollama caches the KV attention state of any stable prompt prefix.
-        # By putting the STATIC JARVIS protocol text FIRST, Ollama reuses its
-        # cached KV for all those tokens on every request.  Only the small
-        # dynamic tail (memory + time, ~50-80 tokens) needs re-evaluation.
-        # This turns a 17-second first-token into a sub-second one after warmup.
-        #
-        # Rule: static content first → semi-static memory middle → dynamic time LAST.
-        sys_p   = _load_system_prompt()               # static — never changes mid-session
+        sys_p   = _load_system_prompt()
         memory  = load_memory()
-        mem_str = format_memory_for_prompt(memory)    # semi-static — changes only when user tells facts
+        mem_str = format_memory_for_prompt(memory)
+
+        # ═══════════════════════════════════════════════════════════════════
+        # MEJORA #7: Contexto social — cómo ser útil, no manipulativo
+        # ═══════════════════════════════════════════════════════════════════
+        social_context = ""
+        if memory:
+            parts_ctx = []
+            # Preferencias de comunicación
+            comm_style = memory.get("preferences", {}).get("communication_style", {}).get("value", "")
+            if comm_style:
+                parts_ctx.append(f"User communication preference: {comm_style}")
+            # Proyectos activos
+            active_projects = memory.get("projects", {})
+            if active_projects:
+                project_names = [k for k in active_projects.keys()]
+                parts_ctx.append(f"User's active projects: {', '.join(project_names)}")
+            # Preferencias de UI
+            ui_prefs = {k: v.get("value", "") for k, v in memory.get("preferences", {}).items() if k != "communication_style"}
+            if ui_prefs:
+                parts_ctx.append(f"User preferences: {ui_prefs}")
+
+            if parts_ctx:
+                social_context = "\n\n[CONTEXT]\n" + "\n".join(parts_ctx) + "\nUse this to be helpful."
+
         now     = datetime.now()
         time_ctx = (
             f"[CURRENT DATE & TIME]\n"
@@ -667,6 +1190,8 @@ class JarvisLocal:
         parts = [sys_p]
         if mem_str:
             parts.append(mem_str)
+        if social_context:
+            parts.append(social_context)
         parts.append(time_ctx)
         return "\n\n".join(parts)
 
@@ -674,15 +1199,8 @@ class JarvisLocal:
     # Speaking state & TTS
     # ------------------------------------------------------------------
 
-    # ------------------------------------------------------------------
-    # TTS queue worker — plays sentences sequentially, no overlaps
-    # ------------------------------------------------------------------
-
     def _tts_worker(self) -> None:
-        # Block until TTS engine is loaded.  Queued items are preserved
-        # and played immediately once loading completes — nothing is lost.
         self._tts_ready.wait(timeout=120)
-
         while True:
             text = self._tts_queue.get()
             try:
@@ -714,6 +1232,7 @@ class JarvisLocal:
             return
         with self._speaking_lock:
             self._speaking = True
+            self._barge_in.reset()      
         self._tts_queue.put(text)
 
     def speak_error(self, tool_name: str, error) -> None:
@@ -721,12 +1240,39 @@ class JarvisLocal:
         self.ui.write_log(f"ERR: {tool_name} — {short}")
         self.speak(f"{tool_name} encountered an error.")
 
+    # FIX #4: Método para detener TTS (usado por barge-in)
+    def stop_speaking(self) -> None:
+        """Fuerza la detención del TTS actual. Llamado por barge-in."""
+        with self._speaking_lock:
+            self._speaking = False
+        # Detener pygame.mixer.music
+        try:
+            import pygame
+            if pygame.mixer.get_init():
+                pygame.mixer.music.stop()
+        except Exception:
+            pass
+        # Detener TTS original (por si acaso)
+        if self._tts:
+            try:
+                self._tts.stop()
+            except Exception:
+                pass
+        # Limpiar la cola de TTS
+        while not self._tts_queue.empty():
+            try:
+                self._tts_queue.get_nowait()
+                self._tts_queue.task_done()
+            except queue.Empty:
+                break
+        if not self.ui.muted:
+            self.ui.set_state("LISTENING")
+
     # ------------------------------------------------------------------
-    # Live reconfigure (called when user clicks Apply in Configure panel)
+    # Live reconfigure
     # ------------------------------------------------------------------
 
     def reconfigure(self, new_config: dict) -> None:
-        """Non-blocking: spawns a background thread to install + reload."""
         threading.Thread(
             target=self._do_reconfigure, args=(new_config,), daemon=True
         ).start()
@@ -737,23 +1283,20 @@ class JarvisLocal:
         new_stt_engine = new_config.get("stt_engine", "whisper").lower()
         self._config = new_config
 
-        # Install any packages required by the new config
         try:
             from core.installer import install_for_config
             install_for_config(new_config, log=self.ui.write_log)
         except Exception as e:
             self.ui.write_log(f"ERR: Dependency install — {e}")
 
-        # TTS: always hot-reload (runs in queue worker, safe to swap)
         try:
             from core.tts import create_tts_player
             self._tts = create_tts_player(new_config)
-            self._tts_ready.set()   # ensure worker isn't blocked
+            self._tts_ready.set()
             self.ui.write_log("SYS: TTS reconfigured.")
         except Exception as e:
             self.ui.write_log(f"ERR: TTS reconfigure — {e}")
 
-        # STT: hot-reload if same engine type; full restart needed if engine changed
         if old_stt_engine == new_stt_engine:
             try:
                 stt_language = new_config.get("stt_language", "auto")
@@ -769,7 +1312,6 @@ class JarvisLocal:
         else:
             self.ui.write_log("SYS: STT engine changed — restart required.")
 
-        # LLM warmup if model changed
         if new_config.get("llm_model", "") != old_llm_model:
             self.ui.write_log("SYS: Warming up new LLM model…")
             from core.llm_client import warmup_model
@@ -782,21 +1324,22 @@ class JarvisLocal:
             self.speak("LLM and TTS updated. Restart for speech engine change.")
 
     # ------------------------------------------------------------------
-    # Text command (from UI input box)
+    # Text command
     # ------------------------------------------------------------------
 
     def _on_text_command(self, text: str) -> None:
         self._text_queue.put(text)
 
     # ------------------------------------------------------------------
-    # Tool execution (routing unchanged from original)
+    # Tool execution
     # ------------------------------------------------------------------
-
     def _execute_tool(self, name: str, args: dict) -> str:
         print(f"[JARVIS] 🔧 {name}  {args}")
         self.ui.set_state("THINKING")
 
-        # save_memory is handled silently
+        # Normalizar parametros que el LLM suele nombrar mal
+        args = _normalize_tool_args(name, args)
+
         if name == "save_memory":
             category = args.get("category", "notes")
             key      = args.get("key", "")
@@ -839,7 +1382,6 @@ class JarvisLocal:
                 result = r or "Done."
 
             elif name == "screen_process":
-                # Synchronous call — returns analysis text which the LLM can speak
                 r = screen_process(parameters=args, response=None, player=self.ui, session_memory=None)
                 result = r if isinstance(r, str) and r else "Screen analyzed."
 
@@ -898,6 +1440,8 @@ class JarvisLocal:
 
             elif name == "shutdown_jarvis":
                 self.ui.write_log("SYS: Shutdown requested.")
+                # FIX #6: Guardar conversación antes de cerrar
+                _save_conversation(self._conversation)
 
                 def _shutdown():
                     import time, os
@@ -927,50 +1471,44 @@ class JarvisLocal:
     # ------------------------------------------------------------------
 
     def _process_message(self, user_text: str) -> None:
-        """
-        Full turn: user_text → LLM stream → TTS (overlapped) → tool execution
-
-        Streaming TTS: sentence events are piped to the TTS queue AS they
-        arrive from the LLM, so Kokoro starts synthesising sentence 1 while
-        the LLM is still generating sentence 2.  This cuts perceived latency
-        from (LLM_total + TTS_total) down to roughly max(LLM_total, TTS_total).
-
-        Tool-call responses never emit sentence events, so the TTS overlap
-        only kicks in for pure conversational replies — which is exactly when
-        it matters most.
-        """
         self.ui.set_state("THINKING")
         self.ui.write_log(f"You: {user_text}")
 
         self._conversation.append({"role": "user", "content": user_text})
 
-        MAX_HISTORY = 10
-        if len(self._conversation) > MAX_HISTORY:
-            self._conversation = self._conversation[-MAX_HISTORY:]
+        # Gestión del historial por tokens
+        MAX_HISTORY_TOKENS = 3000
+
+        total_tokens = sum(
+            _estimate_tokens(msg.get("content", "")) +
+            _estimate_tokens(str(msg.get("tool_calls", "")))
+            for msg in self._conversation
+        )
+
+        while total_tokens > MAX_HISTORY_TOKENS and len(self._conversation) > 2:
+            removed = self._conversation.pop(0)
+            removed_tokens = (
+                _estimate_tokens(removed.get("content", "")) +
+                _estimate_tokens(str(removed.get("tool_calls", "")))
+            )
+            total_tokens -= removed_tokens
+            print(f"[Memory] Eliminado mensaje antiguo (~{removed_tokens} tokens). Total: {total_tokens}")
 
         messages = [
             {"role": "system", "content": self._build_system_prompt()}
         ] + list(self._conversation)
 
-        # Tools whose output needs a second LLM round to summarise/interpret.
-        # Everything else returns a user-ready string → speak directly.
         _NEEDS_LLM_ROUND = {"web_search", "screen_process", "agent_task"}
-
         MAX_TOOL_ROUNDS = 6
+
         for _round in range(MAX_TOOL_ROUNDS):
             final_content    = ""
             final_tool_calls: list = []
-            # Sentences already queued to TTS during streaming (may be empty
-            # for tool-call rounds where the model emits no content).
             _streamed: list[str] = []
 
             try:
                 for event in call_llm_stream(messages, OLLAMA_TOOLS):
                     if event["type"] == "sentence":
-                        # ── Overlap TTS with LLM generation ─────────────────
-                        # Queue this sentence immediately; the TTS worker
-                        # synthesises it while the LLM is still generating
-                        # the next one.
                         _streamed.append(event["text"])
                         self.speak(event["text"])
                     elif event["type"] == "done":
@@ -980,24 +1518,62 @@ class JarvisLocal:
                 self.speak_error("LLM", e)
                 return
 
-            # ── No tool calls: pure conversational reply ─────────────────────
+            # Filtro de tool calls inválidas
+            _valid_names = {d["name"] for d in TOOL_DECLARATIONS}
+            if final_tool_calls:
+                final_tool_calls = [
+                    tc for tc in final_tool_calls
+                    if tc.get("function", {}).get("name", "") in _valid_names
+                ]
+
+            # ═══════════════════════════════════════════════
+            # CASO A — Sin tool calls: respuesta de texto normal
+            # ═══════════════════════════════════════════════
+            # Red de seguridad: detectar tool calls escritas como texto
+            if not final_tool_calls and final_content:
+                text_calls, cleaned_content = _extract_and_clean_text_tool_calls(final_content)
+                if text_calls:
+                    print(f"[JARVIS] {len(text_calls)} tool calls detectadas como texto - ejecutando")
+                    final_tool_calls = text_calls
+                    final_content = cleaned_content
+
             if not final_tool_calls:
-                if _streamed:
-                    # Sentences already queued to TTS — just update history/log.
+                if final_content:
+                    # Red de seguridad: si el modelo escribio codigo en el chat
+                    # en vez de llamar a code_helper, guardarlo igualmente.
+                    # NO auto-guardar si el contenido es JSON/pseudo-tool
+                    content_stripped = final_content.strip()
+                    is_tool_json = (
+                        content_stripped.startswith("```json")
+                        or content_stripped.startswith("{")
+                        or '"name":' in content_stripped
+                        or '"arguments":' in content_stripped
+                        or '"user_response"' in content_stripped
+                        or 'Here are' in content_stripped[:200]
+                    )
+                    if not is_tool_json:
+                        extracted = _extract_code_from_response(final_content)
+                        if extracted:
+                            code_text, lang = extracted
+                            try:
+                                from actions.code_helper import _save_direct
+                                save_result = _save_direct(code_text, "", lang, self.ui)
+                                self.ui.write_log(f"SYS: Codigo auto-guardado ({lang})")
+                                print(f"[JARVIS] Codigo guardado por fallback ({lang})")
+                            except Exception as e:
+                                print(f"[JARVIS] Fallback save fallo: {e}")
+
                     assistant_msg = {"role": "assistant", "content": final_content}
                     messages.append(assistant_msg)
                     self._conversation.append(assistant_msg)
                     self.ui.write_log(f"Jarvis: {final_content}")
-                elif final_content:
-                    # Very short response (no sentence boundary) — speak now.
-                    assistant_msg = {"role": "assistant", "content": final_content}
-                    messages.append(assistant_msg)
-                    self._conversation.append(assistant_msg)
-                    self.ui.write_log(f"Jarvis: {final_content}")
-                    self.speak(final_content)
+                    if not _streamed:
+                        self.speak(final_content)
                 break
 
-            # ── Tool calls present ────────────────────────────────────────────
+            # ═══════════════════════════════════════════════
+            # CASO B — Con tool calls: ejecutar tools
+            # ═══════════════════════════════════════════════
             assistant_msg = {
                 "role":       "assistant",
                 "content":    final_content or "",
@@ -1006,30 +1582,11 @@ class JarvisLocal:
             messages.append(assistant_msg)
             self._conversation.append(assistant_msg)
 
-            # ── Fast path: save_memory + verbal content in same round ────────
             _only_memory = all(
                 tc.get("function", {}).get("name") == "save_memory"
                 for tc in final_tool_calls
             )
-            if _only_memory and final_content:
-                for tc in final_tool_calls:
-                    fn    = tc.get("function", {})
-                    targs = fn.get("arguments", {})
-                    if isinstance(targs, str):
-                        try:
-                            targs = json.loads(targs)
-                        except Exception:
-                            targs = {}
-                    self._execute_tool("save_memory", targs)
-                assistant_msg2 = {"role": "assistant", "content": final_content}
-                messages.append(assistant_msg2)
-                self._conversation.append(assistant_msg2)
-                self.ui.write_log(f"Jarvis: {final_content}")
-                if not _streamed:
-                    self.speak(final_content)
-                break
 
-            # ── Execute tools ─────────────────────────────────────────────────
             all_silent    = True
             _tool_results: list[tuple[str, str]] = []
 
@@ -1044,16 +1601,30 @@ class JarvisLocal:
                         targs = {}
 
                 tc_id = tc.get("id", "")
-                self.ui.write_log(f"SYS: ▶ {tname}")
+                self.ui.write_log(f"SYS: {tname}")
                 result = self._execute_tool(tname, targs)
 
                 if result != "__SILENT__":
                     all_silent = False
                     _tool_results.append((tname, result))
 
+                # Herramientas que devuelven datos brutos y necesitan que el
+                # LLM procese el resultado (no solo confirmar)
+                _RAW_OUTPUT_TOOLS = {"web_search", "screen_process"}
+
+                tool_content = "Done." if result == "__SILENT__" else str(result)
+                if tname in _RAW_OUTPUT_TOOLS and not _only_memory:
+                    tool_content += (
+                        "\n\n[INSTRUCCION CRITICA: Responde AHORA al usuario en "
+                        "TEXTO NATURAL (no JSON, no bloques de codigo). "
+                        "Habla en ESPANOL. Resume los datos de forma util, directa, "
+                        "con tu personalidad. NO uses formato JSON. NO digas 'perfecto'. "
+                        "NO preguntes que mas hacer.]"
+                    )
+
                 tool_msg: dict = {
                     "role":    "tool",
-                    "content": "Done." if result == "__SILENT__" else str(result),
+                    "content": tool_content,
                 }
                 if tc_id:
                     tool_msg["tool_call_id"] = tc_id
@@ -1061,8 +1632,10 @@ class JarvisLocal:
                 messages.append(tool_msg)
                 self._conversation.append(tool_msg)
 
-            # ── Fast-ack: every call was save_memory (silent) ────────────────
-            if all_silent:
+            # ═══════════════════════════════════════════════
+            # SUB-CASO B1 — Solo save_memory: confirmar y salir
+            # ═══════════════════════════════════════════════
+            if _only_memory:
                 _saved_name: str | None = None
                 for _tc in final_tool_calls:
                     _fn = _tc.get("function", {})
@@ -1076,7 +1649,8 @@ class JarvisLocal:
                         if isinstance(_a, dict) and _a.get("key") == "name" and _a.get("value"):
                             _saved_name = str(_a["value"])
                             break
-                _ack = f"Got it, {_saved_name}." if _saved_name else "Noted."
+
+                _ack = f"Anotado, {_saved_name}." if _saved_name else "Anotado."
                 _amsg = {"role": "assistant", "content": _ack}
                 messages.append(_amsg)
                 self._conversation.append(_amsg)
@@ -1084,7 +1658,9 @@ class JarvisLocal:
                 self.speak(_ack)
                 break
 
-            # ── Direct-result: speak tool output, skip LLM round ────────────
+            # ═══════════════════════════════════════════════
+            # SUB-CASO B2 — Tools que NO necesitan ronda del LLM
+            # ═══════════════════════════════════════════════
             if _tool_results and not any(n in _NEEDS_LLM_ROUND for n, _ in _tool_results):
                 _, _reply = _tool_results[-1]
                 _amsg = {"role": "assistant", "content": _reply}
@@ -1094,40 +1670,56 @@ class JarvisLocal:
                 self.speak(_reply)
                 break
 
+            # Si hay tools en _NEEDS_LLM_ROUND, seguimos el bucle para
+            # que el LLM procese los resultados y responda.
+
         if not self.ui.muted:
             self.ui.set_state("LISTENING")
+
+        _save_conversation(self._conversation)
 
     # ------------------------------------------------------------------
     # STT listening loops
     # ------------------------------------------------------------------
-
     def _listen_whisper(self) -> None:
         """Mic → VAD → Whisper → LLM loop."""
-        vad = _VADBuffer()
+        if self._stt is None:
+            self.ui.write_log("ERR: Whisper STT not loaded.")
+            return
+
+        vad = _SileroVAD(sample_rate=SAMPLE_RATE_IN)
         q: queue.Queue = queue.Queue(maxsize=200)
+        stream_rate = {"value": SAMPLE_RATE_IN}
 
         def callback(indata, frames, time_info, status):
             with self._speaking_lock:
                 is_speaking = self._speaking
-            if not is_speaking and not self.ui.muted:
-                try:
-                    q.put_nowait(indata.copy())
-                except queue.Full:
-                    pass
+                is_muted = self.ui.muted
+            if is_muted:
+                return
+            if is_speaking:
+                return
+            try:
+                audio_chunk = _prepare_audio_chunk(indata, source_rate=stream_rate["value"])
+                q.put_nowait(audio_chunk)
+            except queue.Full:
+                pass
 
         try:
             with sd.InputStream(
+                device=None,
                 samplerate=SAMPLE_RATE_IN,
                 channels=CHANNELS,
                 dtype="float32",
                 blocksize=BLOCK_SIZE,
                 callback=callback,
-            ):
-                self.ui.write_log("SYS: Mic active (Whisper STT).")
+            ) as stream:
+                stream_rate["value"] = int(getattr(stream, "samplerate", SAMPLE_RATE_IN))
+                self.ui.write_log(f"SYS: Mic active (Whisper STT + Silero VAD @ {stream_rate['value']} Hz).")
                 while True:
                     try:
                         chunk = q.get(timeout=0.1)
-                        audio = vad.process(chunk.flatten())
+                        audio = vad.process(chunk)
                         if audio is not None:
                             self.ui.set_state("THINKING")
                             text = self._stt.transcribe(audio)
@@ -1139,34 +1731,59 @@ class JarvisLocal:
             print(f"[STT-Whisper] Mic error: {e}")
             traceback.print_exc()
 
+
+# ---------------------------------------------------------------------------
+# Entry
+# ---------------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Text command loop
+    #
+    #  ------------------------------------------------------------------
     def _listen_vosk(self) -> None:
         """Mic → Vosk streaming → LLM loop."""
+        if self._stt is None:
+            self.ui.write_log("ERR: Vosk STT not loaded.")
+            return
+
+        vad = _SileroVAD(sample_rate=SAMPLE_RATE_IN)
         q: queue.Queue = queue.Queue(maxsize=200)
 
         def callback(indata, frames, time_info, status):
             with self._speaking_lock:
                 is_speaking = self._speaking
-            if not is_speaking and not self.ui.muted:
-                try:
-                    q.put_nowait(indata.copy())
-                except queue.Full:
-                    pass
+                is_muted = self.ui.muted
+            if is_muted:
+                return
+            if is_speaking:
+                return
+            try:
+                audio_chunk = np.asarray(indata, dtype=np.int16)
+                if audio_chunk.ndim == 2:
+                    audio_chunk = np.mean(audio_chunk, axis=1)
+                q.put_nowait(audio_chunk.astype(np.int16))
+            except queue.Full:
+                pass
 
         try:
             with sd.InputStream(
+                device=None,
                 samplerate=SAMPLE_RATE_IN,
                 channels=CHANNELS,
                 dtype="int16",
                 blocksize=4096,
                 callback=callback,
             ):
-                self.ui.write_log("SYS: Mic active (Vosk STT).")
+                self.ui.write_log("SYS: Mic active (Vosk STT + Silero VAD).")
                 while True:
                     try:
                         chunk = q.get(timeout=0.1)
-                        text, is_final = self._stt.process_chunk(chunk.tobytes())
-                        if is_final and text.strip():
-                            self._process_message(text)
+                        audio_float = chunk.astype(np.float32) / 32768.0
+                        audio = vad.process(audio_float)
+                        if audio is not None:
+                            audio_int16 = (audio * 32768).astype(np.int16)
+                            text, is_final = self._stt.process_chunk(audio_int16.tobytes())
+                            if is_final and text.strip():
+                                self._process_message(text)
                     except queue.Empty:
                         pass
         except Exception as e:
@@ -1174,9 +1791,87 @@ class JarvisLocal:
             traceback.print_exc()
 
     # ------------------------------------------------------------------
-    # Text command loop (UI input box)
+    # Entry point
+    # 
+    #
+    #  ------------------------------------------------------------------
+        # ------------------------------------------------------------------
+    # FIX #4b: Segundo micrófono dedicado al barge-in (pyaudio)
     # ------------------------------------------------------------------
+    def _barge_in_listener(self) -> None:
+        """
+        Abre un SEGUNDO micrófono con pyaudio (independiente de sounddevice).
+        Solo escucha mientras JARVIS habla. Cuando detecta voz, corta el TTS.
+        """
+        try:
+            import pyaudio
+        except ImportError:
+            print("[Barge-in] ⚠️ pyaudio no instalado. Barge-in desactivado.")
+            print("[Barge-in] ⚠️ Instala con: pip install pyaudio")
+            return
 
+        CHUNK  = 1024
+        FORMAT = pyaudio.paFloat32
+        RATE   = 16_000
+
+        pa = pyaudio.PyAudio()
+        stream = None
+
+        try:
+            stream = pa.open(
+                format=FORMAT,
+                channels=1,
+                rate=RATE,
+                input=True,
+                frames_per_buffer=CHUNK,
+            )
+            print("[Barge-in] 🎤 Segundo micrófono activo (pyaudio)")
+
+            while True:
+                with self._speaking_lock:
+                    is_speaking = self._speaking
+                    is_muted = self.ui.muted
+
+                if is_muted or not is_speaking:
+                    time.sleep(0.02)
+                    continue
+
+                data = stream.read(CHUNK, exception_on_overflow=False)
+                audio_chunk = np.frombuffer(data, dtype=np.float32)
+
+                if self._barge_in.process(audio_chunk):
+                    print("[Barge-in] 🎤 Usuario interrumpió — cortando TTS...")
+                    self.stop_speaking()
+                    captured = self._barge_in.get_captured_audio()
+                    if captured is not None and self._stt:
+                        def _handle_barge_in(audio=captured):
+                            time.sleep(0.5)
+                            text = self._stt.transcribe(audio).strip().lower()
+                            if text in _STOP_WORDS:
+                                print(f"[Barge-in] 🛑 Parada: '{text}' — escuchando…")
+                                if not self.ui.muted:
+                                    self.ui.set_state("LISTENING")
+                            elif len(text) >= 2:
+                                print(f"[Barge-in] 📝 Usuario dijo: '{text}'")
+                                self._text_queue.put(text)
+                            else:
+                                print(f"[Barge-in] 🗑️ Ignorado (ruido): '{text}'")
+                                if not self.ui.muted:
+                                    self.ui.set_state("LISTENING")
+                        threading.Thread(target=_handle_barge_in, daemon=True).start()
+
+        except Exception as e:
+            print(f"[Barge-in] ⚠️ Error en segundo micrófono: {e}")
+            traceback.print_exc()
+        finally:
+            if stream is not None:
+                stream.stop_stream()
+                stream.close()
+            pa.terminate()
+
+    # ------------------------------------------------------------------
+    # Text command loop
+    # ------------------------------------------------------------------
     def _text_command_loop(self) -> None:
         while True:
             try:
@@ -1185,24 +1880,10 @@ class JarvisLocal:
                     self._process_message(text)
             except queue.Empty:
                 pass
-
-    # ------------------------------------------------------------------
-    # Entry point
-    # ------------------------------------------------------------------
-
     def run(self) -> None:
-        """
-        Startup strategy — optimised for minimum time-to-interactive:
-
-        1. LLM warmup + STT load  →  parallel, fast (~3s)
-        2. TTS load               →  parallel, slow (~20s for Kokoro)
-        3. Wait only for (1)      →  go online immediately
-        4. TTS finishes in BG     →  queued speech plays automatically
-        """
         try:
             self.ui.on_reconfigure = self.reconfigure
 
-            # ── Ollama ────────────────────────────────────────────────────
             from core.llm_client import ensure_ollama_running, warmup_model
             self.ui.write_log("SYS: Checking Ollama…")
             if ensure_ollama_running():
@@ -1210,25 +1891,18 @@ class JarvisLocal:
             else:
                 self.ui.write_log("ERR: Ollama unavailable — run: ollama serve")
 
-            # ── Config ────────────────────────────────────────────────────
             stt_engine   = self._config.get("stt_engine",   "whisper").lower()
             stt_language = self._config.get("stt_language", "auto")
             stt_model    = self._config.get("stt_model",    "base")
             tts_engine   = self._config.get("tts_engine",   "edgetts").lower()
 
-            # ── Startup progress panel ────────────────────────────────────
             self.ui.show_startup_panel()
 
             _warmup_done = threading.Event()
             _stt_done    = threading.Event()
 
-            # ── LLM warmup thread ─────────────────────────────────────────
             def _do_warmup():
                 try:
-                    # Pass the STATIC system prompt so Ollama evaluates and caches
-                    # its KV state during startup.  Real requests start with the same
-                    # static prefix → Ollama reuses cached KV → first token <1 s
-                    # instead of the ~17 s it takes to re-evaluate 300+ tokens cold.
                     static_prompt = _load_system_prompt()
                     warmup_model(system_prompt=static_prompt)
                     self.ui.write_log("SYS: LLM ready.")
@@ -1239,10 +1913,9 @@ class JarvisLocal:
                 finally:
                     _warmup_done.set()
 
-            # ── STT load thread ───────────────────────────────────────────
             def _do_stt():
                 try:
-                    self.ui.write_log(f"SYS: Loading {stt_engine.upper()} STT…")
+                    self.ui.write_log(f"SYS: Loading {stt_engine.upper()} STT + Silero VAD…")
                     if stt_engine == "vosk":
                         from core.stt import VoskSTT
                         self._stt = VoskSTT(
@@ -1260,7 +1933,6 @@ class JarvisLocal:
                 finally:
                     _stt_done.set()
 
-            # ── TTS load thread — does NOT block going online ─────────────
             def _do_tts():
                 try:
                     self.ui.write_log(f"SYS: Loading {tts_engine.upper()} TTS…")
@@ -1268,7 +1940,7 @@ class JarvisLocal:
                         self.ui.write_log("SYS: Kokoro — loading model + compiling JIT…")
                     from core.tts import create_tts_player
                     self._tts = create_tts_player(self._config)
-                    self._tts_ready.set()          # unblock _tts_worker
+                    self._tts_ready.set()
                     self.ui.write_log("SYS: TTS ready.")
                     self.ui.mark_startup_ready("tts")
                     self.ui.set_startup_status("● All systems ready.")
@@ -1280,25 +1952,22 @@ class JarvisLocal:
                     self.ui.mark_startup_ready("tts", error=True)
                     self._tts_ready.set()
 
-            # Launch all three simultaneously
             self.ui.write_log("SYS: Loading systems in parallel…")
             threading.Thread(target=_do_warmup, daemon=True).start()
             threading.Thread(target=_do_stt,    daemon=True).start()
             threading.Thread(target=_do_tts,    daemon=True).start()
 
-            # ── Wait ONLY for STT + LLM (fast) ────────────────────────────
             _warmup_done.wait(timeout=60)
             _stt_done.wait(timeout=60)
 
-            # ── Go online immediately ──────────────────────────────────────
             self.ui.write_log("SYS: JARVIS online.")
             self.ui.set_state("LISTENING")
             self.ui.set_startup_status("● JARVIS online · Voice loading in background…")
 
             threading.Thread(target=self._tts_worker,        daemon=True).start()
+            threading.Thread(target=self._barge_in_listener, daemon=True).start()
             threading.Thread(target=self._text_command_loop,  daemon=True).start()
 
-            # STT loop — blocks this thread forever
             if stt_engine == "vosk":
                 self._listen_vosk()
             else:
@@ -1307,33 +1976,19 @@ class JarvisLocal:
         except Exception as e:
             self.ui.write_log(f"ERR: Init failed — {e}")
             traceback.print_exc()
-
-
-# ---------------------------------------------------------------------------
-# Entry
-# ---------------------------------------------------------------------------
-
 def main() -> None:
-    # ── Pre-import torch in background immediately ─────────────────────────
-    # By the time the TTS thread starts (~5s from now), torch will already
-    # be in sys.modules — removing it from the TTS critical path entirely.
     def _preload_torch():
         try:
-            import torch  # noqa: F401  (side-effect import only)
+            import torch  # noqa: F401
         except Exception:
             pass
     threading.Thread(target=_preload_torch, daemon=True).start()
-    # ───────────────────────────────────────────────────────────────────────
 
     ui = JarvisUI("face.png")
 
     def runner():
-        # 1. Wait until the user completes the setup overlay (first run)
-        #    or config already exists (subsequent runs).
         ui.wait_for_api_key()
 
-        # 2. Install any missing engine packages before loading engines.
-        #    Progress is streamed to the log panel in real time.
         ui.write_log("SYS: Checking dependencies…")
         cfg = _load_config()
         _install_done = threading.Event()
@@ -1348,9 +2003,8 @@ def main() -> None:
                 _install_done.set()
 
         threading.Thread(target=_do_install, daemon=True).start()
-        _install_done.wait()   # blocks runner thread; UI remains responsive
+        _install_done.wait()
 
-        # 3. Start the assistant (loads STT / TTS / LLM).
         jarvis = JarvisLocal(ui)
         try:
             jarvis.run()

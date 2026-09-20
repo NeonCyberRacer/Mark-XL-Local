@@ -4,6 +4,7 @@ Text-to-Speech engines for MARK XL.
 EdgeTTS     – free Microsoft TTS (internet required, no API key)
 Kokoro      – fully offline neural TTS (~330 MB model)
 ElevenLabs  – cloud API (API key required, best quality)
+Voicebox    – local REST API (Voicebox app must be running, no API key)
 """
 from __future__ import annotations
 
@@ -15,7 +16,10 @@ from typing import Callable, Optional
 
 import numpy as np
 import sounddevice as sd
-
+# ═══ FORZAR MODO ONLINE PARA HUGGING FACE (KOKORO) ═══
+os.environ.setdefault("HF_HUB_OFFLINE", "0")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "0")
+os.environ.setdefault("HF_DATASETS_OFFLINE", "0")
 
 
 # USE_TF=0 stops transformers from importing TensorFlow (saves 4-8 s startup).
@@ -78,22 +82,27 @@ def _compress_silence(
 
 
 def _play_np(samples, sample_rate: int) -> None:
-    """Play float32 mono (or stereo) audio via sounddevice.
-    Accepts numpy arrays or PyTorch tensors.
-    """
-    sd.play(_to_numpy(samples), sample_rate)
+    """Play float32 mono (or stereo) audio via sounddevice."""
+    arr = _to_numpy(samples)
+    arr = np.nan_to_num(arr, nan=0.0, posinf=1.0, neginf=-1.0)
+    sd.play(arr, sample_rate)
     sd.wait()
-
 
 def _play_audio_bytes(audio_bytes: bytes) -> None:
     """Decode MP3/WAV/OGG bytes and play via sounddevice (uses miniaudio)."""
     import miniaudio
-    decoded = miniaudio.decode(
-        audio_bytes,
-        output_format=miniaudio.SampleFormat.FLOAT32,
-        nchannels=1,
-    )
+    try:
+        decoded = miniaudio.decode(
+            audio_bytes,
+            output_format=miniaudio.SampleFormat.FLOAT32,
+        )
+    except Exception as e:
+        print(f"[TTS] Audio decode failed: {e}")
+        return
     samples = np.array(decoded.samples, dtype=np.float32)
+    if decoded.nchannels > 1:
+        samples = samples.reshape(-1, decoded.nchannels).mean(axis=1)
+    samples = np.nan_to_num(samples, nan=0.0, posinf=1.0, neginf=-1.0)
     sd.play(samples, decoded.sample_rate)
     sd.wait()
 
@@ -196,20 +205,20 @@ def _import_kokoro_pipeline():
 
 
 # Kokoro voice prefix → KPipeline lang_code mapping
+# ═══ MAPA DE IDIOMAS DE KOKORO (Sin espacios, con guion bajo) ═══
 _KOKORO_LANG_CODES = {
-    "a": "a",   # American English  (af_*, am_*)
-    "b": "b",   # British English   (bf_*, bm_*)
-    "j": "j",   # Japanese          (jf_*, jm_*)
-    "z": "z",   # Mandarin Chinese  (zf_*, zm_*)
-    "s": "s",   # Spanish           (sf_*, sm_*)
-    "f": "f",   # French            (ff_*, fm_*)
-    "h": "h",   # Hindi             (hf_*, hm_*)
-    "i": "i",   # Italian           (if_*, im_*)
-    "p": "p",   # Brazilian Portuguese
-    "r": "r",   # Russian           (rf_*, rm_*)
-    "e": "e",   # German            (ef_*, em_*)
+    "a": "a",   # American English  (af_, am_)
+    "b": "b",   # British English   (bf_, bm_)
+    "j": "j",   # Japanese          (jf_, jm_)
+    "z": "z",   # Mandarin Chinese  (zf_, zm_)
+    "e": "e",   # Spanish           (ef_, em_)
+    "f": "f",   # French            (ff_)
+    "h": "h",   # Hindi             (hf_, hm_)
+    "i": "i",   # Italian           (if_, im_)
+    "p": "p",   # Brazilian Portuguese (pf_, pm_)
+    "k": "k",   # Korean
+    "g": "g",   # German
 }
-
 
 class KokoroTTSEngine:
     """Fully offline Kokoro neural TTS.
@@ -324,13 +333,21 @@ class KokoroTTSEngine:
         synth_thread.start()
 
         # Player runs in this thread so sd.wait() doesn't block the synth thread.
-        while True:
-            arr = audio_q.get()
-            if arr is None:
-                break
-            _play_np(arr, 24000)
-
-        synth_thread.join()
+        try:
+            while True:
+                arr = audio_q.get()
+                if arr is None:
+                    break
+                _play_np(arr, 24000)
+        finally:
+            # Drenar la cola para que el synth_thread no quede colgado
+            # si el player falla a mitad de reproduccion.
+            while True:
+                try:
+                    audio_q.get_nowait()
+                except _queue.Empty:
+                    break
+            synth_thread.join(timeout=2.0)
 
         if synth_error:
             raise synth_error[0]
@@ -360,6 +377,168 @@ class ElevenLabsTTSEngine:
         )
         resp.raise_for_status()
         _play_audio_bytes(resp.content)
+
+
+# ---------------------------------------------------------------------------
+# Voicebox TTS Engine
+# ---------------------------------------------------------------------------
+
+class VoiceboxTTSEngine:
+    """Voicebox local TTS — calls the Voicebox REST API at localhost:17493.
+
+    Requirements:
+      - Voicebox app must be running in the background (it stays running after
+        closing the window — the tray icon confirms it).
+      - At least one voice profile must be created in Voicebox (e.g. DARTH VADER).
+
+    Config keys (in api_keys.json):
+      "tts_engine": "voicebox"
+      "tts_voice":  "<profile_id>"   ← optional; auto-detected if empty
+
+    Profile auto-detection order:
+      1. Name contains VADER or DARTH
+      2. Name contains JARVIS
+      3. First profile in the list
+    """
+
+    BASE_URL = "http://127.0.0.1:17493"
+
+    def __init__(self, profile_id: str = ""):
+        self.profile_id = profile_id or self._auto_detect_profile()
+        if not self.profile_id:
+            raise RuntimeError(
+                "[TTS] Voicebox: no voice profile found.\n"
+                "  1. Make sure Voicebox is running\n"
+                "  2. Open Voicebox → Voices → create a profile\n"
+                "  3. Restart Mark-XL"
+            )
+        print(f"[TTS] Voicebox ready — profile: {self.profile_id}")
+
+    def _auto_detect_profile(self) -> str:
+        """Search for VADER/DARTH/JARVIS profile; fallback to first available."""
+        import requests
+        try:
+            resp = requests.get(f"{self.BASE_URL}/profiles", timeout=5)
+            resp.raise_for_status()
+            profiles = resp.json()
+        except Exception as e:
+            print(f"[TTS] Voicebox: could not connect to {self.BASE_URL} — {e}")
+            print("[TTS] Make sure Voicebox is open and running in the background.")
+            return ""
+
+        if not profiles:
+            print("[TTS] Voicebox: no voice profiles found. Create one in Voicebox first.")
+            return ""
+
+        # Debug: print all profile names so we can see what's available
+        print(f"[TTS] Voicebox: found {len(profiles)} profile(s): "
+              f"{[p.get('name','?') for p in profiles]}")
+
+        # Priority search by keyword in profile name (flexible matching)
+        for keyword in ("VADER", "DARTH", "JARVIS"):
+            for p in profiles:
+                name = p.get("name", "") or p.get("label", "") or p.get("title", "")
+                if keyword in name.upper():
+                    print(f"[TTS] Voicebox: auto-selected profile '{name}' (id={p['id']})")
+                    return p["id"]
+
+        # Fallback: last profile (DARTH VADER was created after 'you', so it's likely last)
+        p = profiles[-1]
+        name = p.get("name", "?")
+        print(f"[TTS] Voicebox: auto-selected last profile '{name}' (id={p['id']})")
+        return p["id"]
+
+    def _poll_generation(self, gen_id: str) -> str:
+        """Poll until generation is done. Returns local audio file path."""
+        import requests
+        import time
+        import os
+
+        print(f"[TTS] Voicebox: waiting for generation {gen_id[:8]}…")
+
+        for _ in range(120):   # 60s timeout (0.5s intervals)
+            time.sleep(0.5)
+            try:
+                # Try single-item endpoint first
+                r = requests.get(f"{self.BASE_URL}/history/{gen_id}", timeout=5)
+                if r.status_code == 200:
+                    data = r.json()
+                else:
+                    # Fallback: search the history list
+                    r2 = requests.get(f"{self.BASE_URL}/history", timeout=5)
+                    if r2.status_code != 200:
+                        continue
+                    items = r2.json()
+                    # history might be a list or a dict with "items" key
+                    if isinstance(items, dict):
+                        items = items.get("items", items.get("data", []))
+                    data = next((x for x in items if x.get("id") == gen_id), None)
+                    if data is None:
+                        continue
+            except Exception as e:
+                print(f"[TTS] Voicebox poll error: {e}")
+                continue
+
+            status = data.get("status", "")
+            if status in ("done", "complete", "completed", "finished", "ready"):
+                audio_path = data.get("audio_path", "")
+                if audio_path and os.path.isfile(audio_path):
+                    return audio_path
+                # audio_path might be a URL or relative path
+                if audio_path:
+                    return audio_path
+                # Try fetching audio directly via API
+                ar = requests.get(f"{self.BASE_URL}/history/{gen_id}/audio", timeout=30)
+                if ar.ok and "json" not in ar.headers.get("content-type", ""):
+                    return f"__bytes__{gen_id}"   # signal to caller
+                print(f"[TTS] Voicebox: done but no audio path. data={data}")
+                return ""
+            elif status == "error":
+                raise RuntimeError(f"[TTS] Voicebox generation error: {data.get('error', '?')}")
+            # else: still generating — keep polling
+
+        raise RuntimeError("[TTS] Voicebox: generation timed out after 60s")
+
+    def speak(self, text: str) -> None:
+        import requests
+        import os
+
+        # Submit generation request
+        resp = requests.post(
+            f"{self.BASE_URL}/generate",
+            json={"text": text, "profile_id": self.profile_id},
+            timeout=30,
+        )
+        resp.raise_for_status()
+
+        ct = resp.headers.get("content-type", "")
+
+        # Synchronous response: raw audio bytes
+        if "json" not in ct:
+            _play_audio_bytes(resp.content)
+            return
+
+        # Asynchronous response: generation job
+        gen = resp.json()
+        gen_id = gen.get("id", "")
+        if not gen_id:
+            raise RuntimeError(f"[TTS] Voicebox: no generation ID in response: {gen}")
+
+        # Poll until done
+        audio_path = self._poll_generation(gen_id)
+        if not audio_path:
+            raise RuntimeError("[TTS] Voicebox: generation completed but no audio found")
+
+        # Play the result
+        if os.path.isfile(audio_path):
+            with open(audio_path, "rb") as f:
+                _play_audio_bytes(f.read())
+        else:
+            # Treat as URL
+            url = audio_path if audio_path.startswith("http") else f"{self.BASE_URL}{audio_path}"
+            ar = requests.get(url, timeout=30)
+            ar.raise_for_status()
+            _play_audio_bytes(ar.content)
 
 
 # ---------------------------------------------------------------------------
@@ -422,6 +601,9 @@ def create_tts_player(config: dict) -> TTSPlayer:
         api_key  = config.get("elevenlabs_api_key", "")
         voice_id = config.get("tts_voice", "pNInz6obpgDQGcFmaJgB")
         engine   = ElevenLabsTTSEngine(api_key=api_key, voice_id=voice_id)
+    elif engine_name == "voicebox":
+        profile_id = config.get("tts_voice", "")
+        engine     = VoiceboxTTSEngine(profile_id=profile_id)
     else:   # edgetts (default)
         voice  = config.get("tts_voice", "en-US-GuyNeural")
         engine = EdgeTTSEngine(voice=voice)

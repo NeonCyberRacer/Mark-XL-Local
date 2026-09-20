@@ -227,31 +227,42 @@ def open_app(
     player=None,
     session_memory=None,
 ) -> str:
-    app_name = (parameters or {}).get("app_name", "").strip()
+    p = parameters or {}
+
+    # Tolerancia: aceptar varios nombres de parámetro
+    app_name = ""
+    for key in ("app_name", "app", "name", "application", "program", "appname"):
+        val = p.get(key, "")
+        if isinstance(val, str) and val.strip():
+            app_name = val.strip()
+            break
 
     if not app_name:
-        return "No application name provided."
+        return "No se ha proporcionado nombre de aplicación."
 
     launcher = _OS_LAUNCHERS.get(_SYSTEM)
     if launcher is None:
-        return f"Unsupported operating system: {_SYSTEM}"
+        return f"Sistema operativo no soportado: {_SYSTEM}"
 
     normalized = _normalize(app_name)
-    print(f"[open_app] Launching: '{app_name}' → '{normalized}' ({_SYSTEM})")
+    print(f"[open_app] Lanzando: '{app_name}' → '{normalized}' ({_SYSTEM})")
 
-    if player:
-        player.write_log(f"[open_app] {app_name}")
+    if player and hasattr(player, "write_log"):
+        try:
+            player.write_log(f"[open_app] {app_name}")
+        except Exception:
+            pass
 
     try:
         if launcher(normalized):
-            return f"Opened {app_name}."
+            return f"Abierto {app_name}."
         if normalized.lower() != app_name.lower():
             if launcher(app_name):
-                return f"Opened {app_name}."
+                return f"Abierto {app_name}."
         return (
-            f"Could not confirm that {app_name} launched. "
-            f"It may still be loading, or it might not be installed."
+            f"No pude confirmar que {app_name} se haya lanzado. "
+            f"Puede seguir cargando, o no estar instalado."
         )
     except Exception as e:
         print(f"[open_app] Error: {e}")
-        return f"Failed to open {app_name}: {e}"
+        return f"Falló al abrir {app_name}: {e}"

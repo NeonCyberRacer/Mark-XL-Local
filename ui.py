@@ -83,6 +83,13 @@ class _SysMetrics:
         self._last_net = psutil.net_io_counters()
         self._last_net_t = time.time()
         self._running = True
+        # Cache para evitar subprocess cada 1.5s
+        self._gpu_cache = -1.0
+        self._gpu_cache_t = 0.0
+        self._tmp_cache = -1.0
+        self._tmp_cache_t = 0.0
+        self._gpu_cache_ttl = 10.0   # 10 segundos
+        self._tmp_cache_ttl = 15.0   # 15 segundos
         t = threading.Thread(target=self._loop, daemon=True)
         t.start()
 
@@ -110,9 +117,18 @@ class _SysMetrics:
         self._last_net   = nc
         self._last_net_t = now
 
-        gpu = self._get_gpu()
+        # GPU: solo consultar cada N segundos
+        now2 = time.time()
+        if now2 - self._gpu_cache_t > self._gpu_cache_ttl:
+            self._gpu_cache = self._get_gpu()
+            self._gpu_cache_t = now2
+        gpu = self._gpu_cache
 
-        tmp = self._get_temp()
+        # TMP: solo consultar cada N segundos
+        if now2 - self._tmp_cache_t > self._tmp_cache_ttl:
+            self._tmp_cache = self._get_temp()
+            self._tmp_cache_t = now2
+        tmp = self._tmp_cache
 
         with self._lock:
             self.cpu = cpu
@@ -277,7 +293,8 @@ class HudCanvas(QWidget):
         try:
             from PIL import Image, ImageDraw
             import io
-            img = Image.open(path).convert("RGBA")
+            with Image.open(path) as im:
+                img = im.convert("RGBA")
             sz  = min(img.size)
             img = img.resize((sz, sz), Image.LANCZOS)
             mk  = Image.new("L", (sz, sz), 0)
@@ -1066,7 +1083,7 @@ class SetupOverlay(QWidget):
         layout.addWidget(_lbl("TEXT-TO-SPEECH ENGINE", 7, col=C.TEXT_DIM,
                                align=Qt.AlignmentFlag.AlignLeft))
         tts_row, self._tts_btns = _toggle_row(
-            [("edgetts","🔈 EdgeTTS"), ("kokoro","🤖 Kokoro"), ("elevenlabs","⚡ ElevenLabs")],
+            [("edgetts","🔈 EdgeTTS"), ("kokoro","🤖 Kokoro"), ("elevenlabs","⚡ ElevenLabs"), ("voicebox","🎙️ Voicebox")],
             lambda: self._sel_tts,
             self._set_tts,
         )
@@ -1203,11 +1220,13 @@ class SetupOverlay(QWidget):
         if not hasattr(self, "_voice_lbl"):
             return
 
-        is_kokoro = (key == "kokoro")
+        is_kokoro   = (key == "kokoro")
+        is_voicebox = (key == "voicebox")
+        hide_voice  = is_kokoro or is_voicebox
 
-        # Kokoro uses a dropdown; other engines use a text input
+        # Kokoro uses a dropdown; voicebox auto-detects; others use text input
         if hasattr(self, "_tts_voice_input"):
-            self._tts_voice_input.setVisible(not is_kokoro)
+            self._tts_voice_input.setVisible(not hide_voice)
         if hasattr(self, "_kokoro_combo"):
             self._kokoro_combo.setVisible(is_kokoro)
 
@@ -1217,6 +1236,8 @@ class SetupOverlay(QWidget):
                 self._tts_voice_input.setPlaceholderText("ElevenLabs voice ID")
         elif key == "kokoro":
             self._voice_lbl.setText("Voice:")
+        elif key == "voicebox":
+            self._voice_lbl.setText("Voicebox:")
         else:  # edgetts
             self._voice_lbl.setText("Voice:")
             if hasattr(self, "_tts_voice_input"):
@@ -1304,9 +1325,13 @@ class SetupOverlay(QWidget):
     def _submit(self):
         llm_model = self._llm_model_input.text().strip()
         if not llm_model:
+            # Reset: marcar borde rojo sin acumular estilos
+            base_style = getattr(self, "_llm_input_base_style", None)
+            if base_style is None:
+                self._llm_input_base_style = self._llm_model_input.styleSheet()
+                base_style = self._llm_input_base_style
             self._llm_model_input.setStyleSheet(
-                self._llm_model_input.styleSheet() +
-                f" QLineEdit {{ border: 1px solid {C.RED}; }}"
+                base_style + f" QLineEdit {{ border: 1px solid {C.RED}; }}"
             )
             return
 
@@ -1316,10 +1341,13 @@ class SetupOverlay(QWidget):
         else:
             stt_model = self._vosk_model_input.text().strip()
 
-        # Voice: Kokoro uses dropdown, others use text input
+        # Voice: Kokoro uses dropdown, voicebox auto-detects, others use text input
         if self._sel_tts == "kokoro":
             tts_voice = self._kokoro_combo.currentData() or "af_heart"
             tts_speed = self._kokoro_speed_combo.currentData() or "1.2"
+        elif self._sel_tts == "voicebox":
+            tts_voice = ""    # auto-detected by VoiceboxTTSEngine (finds DARTH VADER)
+            tts_speed = "1.0"
         else:
             tts_voice = self._tts_voice_input.text().strip() or "en-US-GuyNeural"
             tts_speed = "1.0"
@@ -1954,6 +1982,11 @@ class MainWindow(QMainWindow):
     def _apply_state(self, state: str):
         self.hud.state    = state
         self.hud.speaking = (state == "SPEAKING")
+        # Centralizar muted: si el estado es MUTED, reflejarlo en el HUD
+        if state == "MUTED":
+            self.hud.muted = True
+        elif state in ("LISTENING", "THINKING", "SPEAKING"):
+            self.hud.muted = self._muted
 
     def _check_config(self) -> bool:
         if not API_FILE.exists(): return False

@@ -11,10 +11,6 @@ Supports two backends — selected via  "llm_provider"  in config/api_keys.json:
   "llm_provider": "openai"
         Uses any OpenAI-compatible server: LM Studio, Jan, LocalAI,
         llama.cpp server, vLLM, etc.
-        LM Studio download: https://lmstudio.ai   (default port: 1234)
-        Set  "llm_url": "http://localhost:1234"  in config.
-        Note: tool-calling support depends on the model; use a model that
-        supports function/tool calls (e.g. Qwen2.5, Llama-3.1, Mistral).
 """
 import json
 import re
@@ -26,9 +22,9 @@ from typing import Generator
 
 import requests
 
-# Matches a sentence boundary: [.!?] followed by whitespace, or a blank line.
-# Avoids splitting on decimals (3.5) because those have no space after the dot.
+# Split de frases en [.!?] + whitespace, o doble salto de línea.
 _SENT_END = re.compile(r'(?<=[.!?])\s+|(?<=\n)\s*\n')
+
 
 def get_base_dir() -> Path:
     if getattr(sys, "frozen", False):
@@ -40,49 +36,76 @@ BASE_DIR    = get_base_dir()
 CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
 
 _DEFAULTS = {
-    "llm_url":      "http://localhost:11434",
-    "llm_model":    "llama3.2",
-    "llm_provider": "ollama",   # "ollama" | "openai"
+    "llm_url":         "http://localhost:11434",
+    "llm_model":       "qwen2.5-coder:14b",
+    "llm_provider":    "ollama",
+    "llm_num_gpu":     -1,      # -1 = auto (Ollama decide)
+    "llm_temperature": 0.7,
+    "llm_num_predict": 800,
 }
+
+# Cache de config con mtime — evita leer el archivo en cada llamada
+_config_cache: dict = {}
+_config_mtime: float = 0.0
+
+
+def _load_config() -> dict:
+    global _config_cache, _config_mtime
+    try:
+        mtime = CONFIG_PATH.stat().st_mtime
+        if mtime != _config_mtime:
+            _config_cache = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            _config_mtime = mtime
+        return _config_cache
+    except Exception:
+        return {}
 
 
 def get_llm_provider() -> str:
-    """Returns 'ollama' or 'openai' (covers LM Studio, LocalAI, Jan, etc.)."""
+    """Returns 'ollama' or 'openai'."""
     raw = _load_config().get("llm_provider", "ollama").strip().lower()
     return "openai" if raw in ("openai", "lmstudio", "localai", "jan", "llamacpp") else "ollama"
 
 
-def _load_config() -> dict:
-    try:
-        return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+def get_llm_settings() -> tuple[str, str]:
+    """Returns (base_url, model_name)."""
+    cfg   = _load_config()
+    url   = cfg.get("llm_url",   _DEFAULTS["llm_url"]).rstrip("/")
+    model = cfg.get("llm_model", _DEFAULTS["llm_model"])
+    return url, model
+
+
+def _get_generation_options() -> dict:
+    """Opciones de generación configurables desde api_keys.json."""
+    cfg = _load_config()
+    return {
+        "num_gpu":     int(cfg.get("llm_num_gpu", _DEFAULTS["llm_num_gpu"])),
+        "temperature": float(cfg.get("llm_temperature", _DEFAULTS["llm_temperature"])),
+        "num_predict": int(cfg.get("llm_num_predict", _DEFAULTS["llm_num_predict"])),
+    }
 
 
 def ensure_ollama_running(timeout: int = 15) -> bool:
     """
     For Ollama: ping /api/tags; auto-launch 'ollama serve' if not running.
-    For OpenAI-compatible providers: just ping /v1/models (server must be started manually).
-    Returns True if the LLM server is reachable.
+    For OpenAI-compatible: just ping /v1/models.
     """
     url, _   = get_llm_settings()
     provider = get_llm_provider()
 
     if provider == "openai":
-        # OpenAI-compatible servers (LM Studio, LocalAI, etc.) must be started
-        # by the user — we just check if they're reachable.
         health = f"{url}/v1/models"
         try:
             ok = requests.get(health, timeout=5).status_code == 200
             if ok:
-                print(f"[LLM] OpenAI-compatible server reachable at {url}")
+                print(f"[LLM] Servidor OpenAI-compatible disponible en {url}")
             else:
-                print(f"[LLM] Server at {url} returned non-200.  Is it running?")
+                print(f"[LLM] El servidor en {url} devolvió non-200. ¿Está corriendo?")
             return ok
-        except Exception as e:
+        except Exception:
             print(
-                f"[LLM] Cannot reach OpenAI-compatible server at {url}.\n"
-                "      Make sure LM Studio / LocalAI / Jan is running and the server is started."
+                f"[LLM] No puedo alcanzar el servidor OpenAI-compatible en {url}.\n"
+                "      Asegúrate de que LM Studio / LocalAI / Jan está corriendo."
             )
             return False
 
@@ -98,48 +121,38 @@ def ensure_ollama_running(timeout: int = 15) -> bool:
     if _is_up():
         return True
 
-    print("[LLM] Ollama not running — launching 'ollama serve'…")
+    print("[LLM] Ollama no está corriendo — lanzando 'ollama serve'…")
     try:
         kwargs: dict = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
         if sys.platform == "win32":
             kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
         subprocess.Popen(["ollama", "serve"], **kwargs)
     except FileNotFoundError:
-        print("[LLM] 'ollama' command not found. Install Ollama from https://ollama.com")
+        print("[LLM] Comando 'ollama' no encontrado. Instala desde https://ollama.com")
         return False
     except Exception as e:
-        print(f"[LLM] Could not launch Ollama: {e}")
+        print(f"[LLM] No pude lanzar Ollama: {e}")
         return False
 
     deadline = time.time() + timeout
     while time.time() < deadline:
         time.sleep(1.0)
         if _is_up():
-            print("[LLM] Ollama started successfully.")
+            print("[LLM] Ollama arrancado correctamente.")
             return True
 
-    print("[LLM] Ollama did not respond within the timeout.")
+    print("[LLM] Ollama no respondió dentro del timeout.")
     return False
 
 
 def warmup_model(system_prompt: str | None = None) -> bool:
     """
-    Pre-load the model AND prime Ollama's KV prefix cache.
-
-    Why the system_prompt matters
-    ─────────────────────────────
-    Ollama caches the KV attention state of the prompt prefix across requests.
-    If warmup includes the same system prompt that real requests will use, Ollama
-    evaluates those tokens ONCE at startup.  Every subsequent request only needs
-    to evaluate the small delta (user message ± time context) instead of the full
-    300-500 token system prompt → drops first-token latency from ~17 s to <1 s.
-
-    Pass the *static* part of the system prompt (the JARVIS protocol text, without
-    timestamps or per-minute context) so the prefix stays valid across calls.
+    Pre-carga el modelo y (opcionalmente) prima el KV cache si el prefijo
+    del system prompt es estable entre requests.
     """
     url, model = get_llm_settings()
     provider   = get_llm_provider()
-    print(f"[LLM] Warming up '{model}' ({provider})…")
+    print(f"[LLM] Calentando '{model}' ({provider})…")
 
     messages: list[dict] = []
     if system_prompt:
@@ -147,8 +160,6 @@ def warmup_model(system_prompt: str | None = None) -> bool:
     messages.append({"role": "user", "content": "hi"})
 
     if provider == "openai":
-        # OpenAI-compatible: just fire a minimal request to ensure the model is loaded.
-        # No keep_alive or KV-cache priming available — server manages this internally.
         payload = {
             "model":      model,
             "messages":   messages,
@@ -158,61 +169,64 @@ def warmup_model(system_prompt: str | None = None) -> bool:
         try:
             resp = requests.post(f"{url}/v1/chat/completions", json=payload, timeout=180)
             resp.raise_for_status()
-            print(f"[LLM] '{model}' ready (OpenAI-compatible server).")
+            print(f"[LLM] '{model}' listo (servidor OpenAI-compatible).")
             return True
         except Exception as e:
-            print(f"[LLM] Warmup failed (non-fatal): {e}")
+            print(f"[LLM] Warmup falló (no fatal): {e}")
             return False
 
     # ── Ollama ──────────────────────────────────────────────────────────────
+    opts = _get_generation_options()
     payload = {
         "model":      model,
         "messages":   messages,
         "stream":     False,
         "keep_alive": -1,
-        # num_gpu:99 → push ALL transformer layers to GPU (Ollama caps at available)
-        # This is safe even without a GPU — Ollama silently ignores if n_gpu_layers=0
-        "options":    {"num_predict": 1, "num_gpu": 99},
+        "options":    {"num_predict": 1, "num_gpu": opts["num_gpu"]},
     }
     try:
         resp = requests.post(f"{url}/api/chat", json=payload, timeout=180)
         resp.raise_for_status()
-        print(f"[LLM] '{model}' loaded and KV cache primed.")
+        print(f"[LLM] '{model}' cargado.")
         return True
     except Exception as e:
-        print(f"[LLM] Warmup failed (non-fatal): {e}")
+        print(f"[LLM] Warmup falló (no fatal): {e}")
         return False
 
 
-def get_llm_settings() -> tuple[str, str]:
-    """Returns (base_url, model_name)."""
-    cfg   = _load_config()
-    url   = cfg.get("llm_url",   _DEFAULTS["llm_url"]).rstrip("/")
-    model = cfg.get("llm_model", _DEFAULTS["llm_model"])
-    return url, model
-
-
+def _ollama_payload(messages: list, tools: list | None, stream: bool,
+                    options: dict) -> dict:
+    """Construye el payload para Ollama. Incluye tools SIEMPRE si se pasan."""
+    payload: dict = {
+        "model":      get_llm_settings()[1],
+        "messages":   messages,
+        "stream":     stream,
+        "keep_alive": -1,
+        "options":    options,
+    }
+    if tools:
+        payload["tools"] = tools
+    return payload
 def call_llm(
     messages: list,
     tools:    list | None = None,
     timeout:  int = 120,
 ) -> dict:
     """
-    Non-streaming chat request.  Routes to Ollama or OpenAI-compatible backend.
-
-    Returns:
-        {"content": str, "tool_calls": list}
+    Non-streaming chat.  Returns: {"content": str, "tool_calls": list}
     """
     url, model = get_llm_settings()
     provider   = get_llm_provider()
+    opts       = _get_generation_options()
 
     if provider == "openai":
         endpoint = f"{url}/v1/chat/completions"
         payload: dict = {
-            "model":      model,
-            "messages":   messages,
-            "stream":     False,
-            "max_tokens": 150,
+            "model":       model,
+            "messages":    messages,
+            "stream":      False,
+            "max_tokens":  opts["num_predict"],
+            "temperature": opts["temperature"],
         }
         if tools:
             payload["tools"]       = tools
@@ -222,7 +236,6 @@ def call_llm(
             resp.raise_for_status()
             choice = resp.json().get("choices", [{}])[0]
             msg    = choice.get("message", {})
-            # OpenAI tool_calls format → normalise to Ollama-style
             raw_tc  = msg.get("tool_calls") or []
             tc_list = [
                 {
@@ -243,21 +256,18 @@ def call_llm(
                 "tool_calls": tc_list,
             }
         except Exception as e:
-            raise RuntimeError(f"OpenAI-compatible LLM call failed: {e}")
+            raise RuntimeError(f"Llamada al LLM OpenAI-compatible falló: {e}")
 
     # ── Ollama ──────────────────────────────────────────────────────────────
     endpoint = f"{url}/api/chat"
-    payload = {
-        "model":      model,
-        "messages":   messages,
-        "stream":     False,
-        "keep_alive": -1,
-        "options":    {"num_predict": 150, "num_gpu": 99},
-    }
-    if tools:
-        payload["tools"] = tools
+    payload = _ollama_payload(messages, tools, stream=False,
+                              options={
+                                  "num_predict": opts["num_predict"],
+                                  "num_gpu":     opts["num_gpu"],
+                                  "temperature": opts["temperature"],
+                              })
 
-    try:
+    def _do_call():
         resp = requests.post(endpoint, json=payload, timeout=timeout)
         resp.raise_for_status()
         data = resp.json()
@@ -266,32 +276,29 @@ def call_llm(
             "content":    (msg.get("content") or "").strip(),
             "tool_calls": msg.get("tool_calls") or [],
         }
+
+    try:
+        return _do_call()
     except requests.exceptions.ConnectionError as e:
-        print(f"[LLM] ConnectionError — trying to restart Ollama… ({e})")
+        print(f"[LLM] ConnectionError — intentando reiniciar Ollama… ({e})")
         if ensure_ollama_running():
             try:
-                resp = requests.post(endpoint, json=payload, timeout=timeout)
-                resp.raise_for_status()
-                data = resp.json()
-                msg  = data.get("message", {})
-                return {
-                    "content":    (msg.get("content") or "").strip(),
-                    "tool_calls": msg.get("tool_calls") or [],
-                }
+                return _do_call()
             except Exception:
                 pass
         raise RuntimeError(
-            f"Cannot connect to Ollama at {url}. "
-            "Make sure Ollama is installed and run: ollama serve"
+            f"No puedo conectar con Ollama en {url}. "
+            "Asegúrate de que Ollama está instalado y ejecuta: ollama serve"
         )
     except requests.exceptions.Timeout:
-        raise RuntimeError("Ollama request timed out after 120 s.")
+        raise RuntimeError("La petición a Ollama ha expirado.")
     except requests.exceptions.HTTPError as e:
-        print(f"[LLM] HTTPError: {e.response.status_code} — {e.response.text[:200]}")
-        raise RuntimeError(f"Ollama HTTP error: {e.response.status_code}")
+        code = getattr(e.response, "status_code", "?")
+        print(f"[LLM] HTTPError: {code}")
+        raise RuntimeError(f"Error HTTP de Ollama: {code}")
     except Exception as e:
-        print(f"[LLM] Unexpected error: {type(e).__name__}: {e}")
-        raise RuntimeError(f"LLM call failed: {e}")
+        print(f"[LLM] Error inesperado: {type(e).__name__}: {e}")
+        raise RuntimeError(f"Llamada al LLM falló: {e}")
 
 
 def call_llm_text(
@@ -301,11 +308,12 @@ def call_llm_text(
     timeout: int = 120,
 ) -> str:
     """
-    Simple text-only generation (no tools).
-    Used by planner, executor, error_handler, code_helper, dev_agent.
+    Generación de texto simple (sin tools).
+    Soporta tanto Ollama como OpenAI-compatible.
     """
     url, default_model = get_llm_settings()
-    endpoint = f"{url}/api/chat"
+    provider = get_llm_provider()
+    opts     = _get_generation_options()
     m        = model or default_model
 
     messages: list[dict] = []
@@ -313,26 +321,57 @@ def call_llm_text(
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt})
 
-    payload = {"model": m, "messages": messages, "stream": False, "keep_alive": -1, "options": {"num_predict": 600}}
+    if provider == "openai":
+        endpoint = f"{url}/v1/chat/completions"
+        payload = {
+            "model":       m,
+            "messages":    messages,
+            "stream":      False,
+            "max_tokens":  opts["num_predict"],
+            "temperature": opts["temperature"],
+        }
+        try:
+            resp = requests.post(endpoint, json=payload, timeout=timeout)
+            resp.raise_for_status()
+            return (resp.json().get("choices", [{}])[0]
+                    .get("message", {})
+                    .get("content") or "").strip()
+        except Exception as e:
+            raise RuntimeError(f"Llamada de texto al LLM falló: {e}")
 
-    try:
+    # ── Ollama ──────────────────────────────────────────────────────────────
+    endpoint = f"{url}/api/chat"
+    payload = {
+        "model":      m,
+        "messages":   messages,
+        "stream":     False,
+        "keep_alive": -1,
+        "options": {
+            "num_predict": opts["num_predict"],
+            "num_gpu":     opts["num_gpu"],
+            "temperature": opts["temperature"],
+        },
+    }
+
+    def _do_call():
         resp = requests.post(endpoint, json=payload, timeout=timeout)
         resp.raise_for_status()
         return (resp.json().get("message", {}).get("content") or "").strip()
+
+    try:
+        return _do_call()
     except requests.exceptions.ConnectionError:
         if ensure_ollama_running():
             try:
-                resp = requests.post(endpoint, json=payload, timeout=timeout)
-                resp.raise_for_status()
-                return (resp.json().get("message", {}).get("content") or "").strip()
+                return _do_call()
             except Exception:
                 pass
         raise RuntimeError(
-            f"Cannot connect to Ollama at {url}. "
-            "Make sure Ollama is installed and run: ollama serve"
+            f"No puedo conectar con Ollama en {url}. "
+            "Asegúrate de que Ollama está instalado y ejecuta: ollama serve"
         )
     except Exception as e:
-        raise RuntimeError(f"LLM text call failed: {e}")
+        raise RuntimeError(f"Llamada de texto al LLM falló: {e}")
 
 
 def _stream_openai(
@@ -340,20 +379,17 @@ def _stream_openai(
     tools:    list | None,
     timeout:  int,
 ) -> Generator[dict, None, None]:
-    """
-    Streaming backend for OpenAI-compatible servers (LM Studio, LocalAI, Jan…).
-
-    Parses Server-Sent Events (SSE) and accumulates streaming tool-call fragments
-    so the output format is identical to the Ollama backend.
-    """
+    """Streaming para servidores OpenAI-compatible."""
     url, model = get_llm_settings()
     endpoint   = f"{url}/v1/chat/completions"
+    opts       = _get_generation_options()
 
     payload: dict = {
-        "model":      model,
-        "messages":   messages,
-        "stream":     True,
-        "max_tokens": 150,
+        "model":       model,
+        "messages":    messages,
+        "stream":      True,
+        "max_tokens":  opts["num_predict"],
+        "temperature": opts["temperature"],
     }
     if tools:
         payload["tools"]       = tools
@@ -364,13 +400,11 @@ def _stream_openai(
             resp.raise_for_status()
             full_content = ""
             buf          = ""
-            # tool_call fragments: index → {"id", "function": {"name", "arguments"}}
             tc_fragments: dict[int, dict] = {}
 
             for raw in resp.iter_lines():
                 if not raw:
                     continue
-                # SSE lines look like: b"data: {...}" or b"data: [DONE]"
                 line = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw
                 if not line.startswith("data:"):
                     continue
@@ -389,7 +423,6 @@ def _stream_openai(
                 full_content += text
                 buf          += text
 
-                # Accumulate sentence boundaries for streaming TTS
                 while True:
                     m = _SENT_END.search(buf)
                     if not m:
@@ -399,9 +432,8 @@ def _stream_openai(
                     if sentence:
                         yield {"type": "sentence", "text": sentence}
 
-                # Accumulate streaming tool-call fragments
-                for tc in (delta.get("tool_calls") or []):
-                    idx = tc.get("index", 0)
+                for i, tc in enumerate(delta.get("tool_calls") or []):
+                    idx = tc.get("index", i)
                     if idx not in tc_fragments:
                         tc_fragments[idx] = {"id": "", "function": {"name": "", "arguments": ""}}
                     frag = tc_fragments[idx]
@@ -410,15 +442,9 @@ def _stream_openai(
                     frag["function"]["name"]      += fn.get("name") or ""
                     frag["function"]["arguments"] += fn.get("arguments") or ""
 
-                finish = choice.get("finish_reason")
-                if finish in ("stop", "tool_calls", "length"):
-                    break
-
-            # Flush any trailing content
             if buf.strip():
                 yield {"type": "sentence", "text": buf.strip()}
 
-            # Parse accumulated tool-call argument strings → dicts
             tool_calls: list = []
             for idx in sorted(tc_fragments):
                 frag = tc_fragments[idx]
@@ -426,7 +452,7 @@ def _stream_openai(
                 try:
                     args = json.loads(args)
                 except Exception:
-                    pass   # leave as raw string; _execute_tool handles it
+                    pass
                 tool_calls.append({
                     "id":       frag["id"],
                     "function": {"name": frag["function"]["name"], "arguments": args},
@@ -440,15 +466,16 @@ def _stream_openai(
 
     except requests.exceptions.ConnectionError:
         raise RuntimeError(
-            f"Cannot reach OpenAI-compatible server at {url}.\n"
-            "Make sure LM Studio / LocalAI / Jan is running and the server is started."
+            f"No puedo alcanzar el servidor OpenAI-compatible en {url}.\n"
+            "Asegúrate de que LM Studio / LocalAI / Jan está corriendo."
         )
     except requests.exceptions.Timeout:
-        raise RuntimeError("OpenAI-compatible stream timed out.")
+        raise RuntimeError("El stream OpenAI-compatible ha expirado.")
     except requests.exceptions.HTTPError as e:
-        raise RuntimeError(f"OpenAI-compatible HTTP error: {e.response.status_code}")
+        code = getattr(e.response, "status_code", "?")
+        raise RuntimeError(f"Error HTTP OpenAI-compatible: {code}")
     except Exception as e:
-        raise RuntimeError(f"OpenAI-compatible stream failed: {e}")
+        raise RuntimeError(f"Stream OpenAI-compatible falló: {e}")
 
 
 def call_llm_stream(
@@ -457,14 +484,11 @@ def call_llm_stream(
     timeout:  int = 120,
 ) -> Generator[dict, None, None]:
     """
-    Streaming chat request.  Routes to Ollama or OpenAI-compatible backend.
+    Streaming chat.  Routes to Ollama or OpenAI-compatible backend.
 
     Yields:
-        {"type": "sentence", "text": str}   — each complete sentence as it arrives
-        {"type": "done", "content": str, "tool_calls": list}  — when stream ends
-
-    Sentences are split on [.!?] + whitespace so TTS can start immediately.
-    Tool calls always appear in the final "done" event.
+        {"type": "sentence", "text": str}
+        {"type": "done", "content": str, "tool_calls": list}
     """
     provider = get_llm_provider()
     if provider == "openai":
@@ -473,18 +497,14 @@ def call_llm_stream(
 
     url, model = get_llm_settings()
     endpoint   = f"{url}/api/chat"
+    opts       = _get_generation_options()
 
-    payload: dict = {
-        "model":      model,
-        "messages":   messages,
-        "stream":     True,
-        "keep_alive": -1,
-        # 150 tokens ≈ 100 words ≈ 3-4 sentences — enough for any voice reply.
-        # num_gpu:99 pushes all layers to GPU; num_thread removed (Ollama auto-tunes).
-        "options":    {"num_predict": 150, "num_gpu": 99},
-    }
-    if tools:
-        payload["tools"] = tools
+    payload = _ollama_payload(messages, tools, stream=True,
+                              options={
+                                  "num_predict": opts["num_predict"],
+                                  "num_gpu":     opts["num_gpu"],
+                                  "temperature": opts["temperature"],
+                              })
 
     def _do_stream() -> Generator[dict, None, None]:
         with requests.post(endpoint, json=payload, timeout=timeout, stream=True) as resp:
@@ -492,6 +512,7 @@ def call_llm_stream(
             full_content = ""
             tool_calls:  list = []
             buf          = ""
+            emitted_done = False
 
             for raw in resp.iter_lines():
                 if not raw:
@@ -507,7 +528,6 @@ def call_llm_stream(
                 full_content += delta
                 buf          += delta
 
-                # Yield complete sentences as they accumulate
                 while True:
                     m = _SENT_END.search(buf)
                     if not m:
@@ -524,29 +544,46 @@ def call_llm_stream(
                 if chunk.get("done"):
                     if buf.strip():
                         yield {"type": "sentence", "text": buf.strip()}
-
                     yield {
                         "type":       "done",
                         "content":    full_content.strip(),
                         "tool_calls": tool_calls,
                     }
-                    return
+                    emitted_done = True
+                    break
 
+            # Si el stream terminó sin "done", forzamos uno
+            if not emitted_done:
+                if buf.strip():
+                    yield {"type": "sentence", "text": buf.strip()}
+                yield {
+                    "type":       "done",
+                    "content":    full_content.strip(),
+                    "tool_calls": tool_calls,
+                }
+
+    # Retry solo si NO se ha emitido nada todavía
+    emitted_anything = False
     try:
-        yield from _do_stream()
+        for event in _do_stream():
+            emitted_anything = True
+            yield event
     except requests.exceptions.ConnectionError as e:
-        print(f"[LLM] Stream ConnectionError — trying to restart Ollama… ({e})")
+        if emitted_anything:
+            raise RuntimeError(f"Stream interrumpido tras emitir contenido: {e}")
+        print(f"[LLM] Stream ConnectionError — reintentando Ollama… ({e})")
         if ensure_ollama_running():
             yield from _do_stream()
             return
         raise RuntimeError(
-            f"Cannot connect to Ollama at {url}. "
-            "Make sure Ollama is installed and run: ollama serve"
+            f"No puedo conectar con Ollama en {url}. "
+            "Asegúrate de que Ollama está instalado y ejecuta: ollama serve"
         )
     except requests.exceptions.Timeout:
-        raise RuntimeError("Ollama stream timed out.")
+        raise RuntimeError("El stream de Ollama ha expirado.")
     except requests.exceptions.HTTPError as e:
-        raise RuntimeError(f"Ollama HTTP error: {e.response.status_code}")
+        code = getattr(e.response, "status_code", "?")
+        raise RuntimeError(f"Error HTTP de Ollama: {code}")
     except Exception as e:
         print(f"[LLM] Stream error: {type(e).__name__}: {e}")
-        raise RuntimeError(f"LLM stream failed: {e}")
+        raise RuntimeError(f"Stream del LLM falló: {e}")

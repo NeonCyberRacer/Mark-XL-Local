@@ -1,159 +1,128 @@
-# 🤖 MARK XL — Local AI Assistant
+﻿# Mark XL — Local AI Assistant
 
-> **J.A.R.V.I.S** — Just A Rather Very Intelligent System  
-> Cross-platform voice AI assistant running entirely on local hardware. No cloud APIs required.
+> **J.A.R.V.I.S** — Just A Rather Very Intelligent System
+> Asistente de voz con IA corriendo 100% en local. Sin APIs de pago.
 
----
-
-## Overview
-
-MARK XL is a fully local, real-time voice and visual AI agent. It combines offline speech recognition, a locally hosted LLM (via Ollama), and text-to-speech to deliver a privacy-first personal assistant with OS-level control capabilities.
-
-Successor to the previous mark, which used the Google Gemini Live API. MARK XL removes all cloud LLM dependencies while adding streaming responses, a dynamic configuration UI, and multi-language support.
+Proyecto personal inspirado en conceptos de Mark-LIV de FatihMakes.
 
 ---
 
-## Architecture
+## Aviso importante
 
-```
-Microphone → STT (Whisper / Vosk)
-                  ↓
-           Ollama LLM (tool calling + streaming)
-                  ↓
-         Tool Execution (OS, Browser, Files …)
-                  ↓
-           TTS (EdgeTTS / Kokoro / ElevenLabs)
-                  ↓
-              Speaker
-```
+**Este es un proyecto PERSONAL y EXPERIMENTAL.**
 
-### Core Components
+- NO doy soporte tecnico. Es mi proyecto para mi hardware.
+- Puede tener bugs. Esta en desarrollo activo.
+- No es un producto. Es un experimento que funciona.
 
-| Layer | Technology | Notes |
-|-------|-----------|-------|
-| **STT** | faster-whisper / Vosk | Fully offline. Auto language detection or forced locale. |
-| **LLM** | Ollama (any model) | qwen2.5, llama3.2, mistral, etc. Streaming + tool calling. |
-| **TTS** | EdgeTTS / Kokoro / ElevenLabs | EdgeTTS = free + internet. Kokoro = fully offline. |
-| **UI** | PyQt6 | HUD overlay with system monitor, log panel, file drop zone. |
-| **Agent** | Custom task queue | Multi-step planner + executor + error recovery. |
+Si algo no funciona en tu maquina, lo siento — pero no tengo tiempo ni conocimiento para dar soporte.
 
 ---
 
-## Features
+## Que es esto
 
-- **Streaming responses** — TTS starts speaking on the first sentence, not after the full response
-- **Tool calling** — 18 built-in tools: browser control, file management, weather, YouTube, messaging, screen analysis, code helper, game updater, flight finder, and more
-- **Long-term memory** — Silently saves personal facts; recalled in every conversation
-- **Live configuration** — Change LLM model, STT engine, TTS voice without restarting (⚙ Configure button)
-- **Ollama auto-start** — Automatically launches `ollama serve` if it's not running
-- **Model warmup** — Pre-loads the LLM into memory during startup so the first message is as fast as subsequent ones
-- **Multi-language STT** — Set `stt_language` to `auto` (Whisper detects) or a specific locale (`tr`, `de`, `fr`, …)
-- **Cross-platform** — Windows, macOS, Linux (OS detected automatically at runtime)
-- **File drop zone** — Drag and drop images, PDFs, Word docs, CSV, audio, video for AI processing
+Un asistente personal con:
 
----
-
-## Requirements
-
-- Python 3.11 or 3.12
-- [Ollama](https://ollama.com) installed and a model pulled (e.g. `ollama pull qwen2.5:7b`)
-- A microphone
+- Chat con personalidad (JARVIS companero, directo, espanol)
+- Ejecucion de herramientas reales (abrir apps, controlar PC, etc.)
+- Generacion de codigo (Python, C#, Unity)
+- Vision (analisis de pantalla y camara con modelo local)
+- Memoria persistente
+- 100% offline
 
 ---
 
-## Quick Start
+## Stack tecnico
 
-```bash
-# 1. Install Ollama → https://ollama.com
-#    Then pull a model:
-ollama pull qwen2.5:7b
+| Componente | Tecnologia |
+|---|---|
+| LLM | Ollama (hermes3, gemma4, qwen2.5-coder) |
+| Vision | Ollama (qwen2.5vl:7b) |
+| STT | Whisper (faster-whisper, large-v3) |
+| TTS | Kokoro (voces en espanol) |
+| VAD | Silero VAD |
+| UI | PyQt6 (HUD cyan con animaciones) |
 
-# 2. Clone / download the project and launch
-cd Mark-XL
-python main.py
-```
-
-That's it. On first run MARK XL:
-1. Auto-installs base packages (PyQt6, numpy …) and restarts once
-2. Opens the **Initialisation** overlay — choose STT engine, LLM model, TTS engine
-3. Click **INITIALISE SYSTEMS** — engine packages install in the background (progress shown in log)
-4. JARVIS comes online
-
-After setup, use the **⚙ CONFIGURE** button in the right panel to change any setting at any time without restarting.
+Todo local. Sin Gemini. Sin OpenAI. Sin APIs de pago.
 
 ---
 
-## Configuration (`config/api_keys.json`)
+## Hardware de referencia
 
-```json
-{
-    "stt_engine":         "whisper",
-    "stt_model":          "base",
-    "stt_language":       "auto",
-    "llm_url":            "http://localhost:11434",
-    "llm_model":          "qwen2.5:7b",
-    "tts_engine":         "edgetts",
-    "tts_voice":          "en-US-GuyNeural",
-    "elevenlabs_api_key": ""
-}
-```
+Desarrollado y probado en:
 
-| Key | Values | Default |
-|-----|--------|---------|
-| `stt_engine` | `whisper` / `vosk` | `whisper` |
-| `stt_model` | `tiny` / `base` / `small` / `medium` / `large-v3` | `base` |
-| `stt_language` | `auto` or ISO code (`tr`, `en`, `de` …) | `auto` |
-| `llm_url` | Ollama API base URL | `http://localhost:11434` |
-| `llm_model` | Any model pulled in Ollama | `qwen2.5:7b` |
-| `tts_engine` | `edgetts` / `kokoro` / `elevenlabs` | `edgetts` |
-| `tts_voice` | Voice name / ID depending on engine | `en-US-GuyNeural` |
+- CPU: Intel i5-11600K (6 nucleos / 12 hilos)
+- RAM: 32 GB DDR4-3200
+- GPU: NVIDIA RTX 4060 Ti (16 GB VRAM)
+- OS: Windows 11 Pro
+- Almacenamiento: M.2 NVMe 1 TB + 3 TB HDD
+
+Puede funcionar en hardware menor, pero no lo he probado.
 
 ---
 
-## Built-in Tools
+## Instalacion
 
-| Tool | Description |
-|------|-------------|
-| `open_app` | Opens any application or website |
-| `web_search` | Web search and compare mode |
-| `weather_report` | Current weather for any city |
-| `send_message` | WhatsApp / Telegram messaging |
-| `reminder` | Timed reminders via Task Scheduler |
-| `youtube_video` | Play, summarize, trending videos |
-| `screen_process` | Screen capture + vision model analysis |
-| `computer_settings` | Volume, brightness, window management, shortcuts |
-| `browser_control` | Full Playwright browser automation |
-| `file_controller` | File/folder CRUD, search, disk usage |
-| `desktop_control` | Wallpaper, organize, clean desktop |
-| `code_helper` | Write, edit, explain, run code |
-| `dev_agent` | Build complete multi-file projects |
-| `agent_task` | Multi-step autonomous task execution |
-| `computer_control` | Direct mouse/keyboard control |
-| `game_updater` | Steam / Epic Games install & update |
-| `flight_finder` | Google Flights search |
-| `file_processor` | Process images, PDFs, CSV, audio, video |
+1. Clona el repo:
+   git clone https://github.com/NeonCyberRacer/Mark-XL-Local.git
+   cd Mark-XL-Local
+
+2. Instala Ollama desde ollama.com y descarga los modelos:
+   ollama pull hermes3
+   ollama pull qwen2.5-coder:14b
+   ollama pull qwen2.5vl:7b
+
+3. Copia el config:
+   cp config/api_keys.example.json config/api_keys.json
+
+4. Instala dependencias:
+   pip install -r requirements.txt
+
+5. Arranca:
+   python main.py
 
 ---
 
-## Keyboard Shortcuts
+## Mejoras aplicadas
 
-| Key | Action |
-|-----|--------|
-| `F4` | Mute / unmute microphone |
-| `F11` | Toggle fullscreen |
+- Bug del break que bloqueaba la ejecucion de herramientas: corregido
+- Parser de tool calls como texto (6 formatos): robusto
+- Soporte C#/Unity en code_helper y dev_agent
+- Red de seguridad para codigo auto-generado
+- Normalizacion de argumentos de herramientas
+- Configuracion de GPU (num_gpu) desde JSON
+- Soporte OpenAI-compatible en call_llm_text
+- update_memory atomico (sin race condition)
+- Proteccion contra path traversal en file_controller
+- Deteccion de binarios en read_file
+- Sanitizacion de valores en format_memory_for_prompt
+- Truncado por lineas en memoria
+- stt.py con rutas no hardcodeadas
+- tts.py con HF_HUB_OFFLINE respetado
+- paths.py centralizado (soporte OneDrive)
+- desktop_control sin ejecucion dinamica (seguridad)
+- Fixes en ui.py (cache GPU, stylesheet)
+- Fixes en installer.py (pip fallbacks)
 
 ---
 
-## TTS Engine Comparison
+## Licencia
 
-| Engine | Internet | Quality | Cost |
-|--------|----------|---------|------|
-| EdgeTTS | Required | Good | Free |
-| Kokoro | No | Excellent | Free (local model ~100 MB) |
-| ElevenLabs | Required | Best | Paid API |
+Creative Commons BY-NC 4.0. Ver LICENSE.
+
+Uso personal y no comercial permitido. NO se permite uso comercial.
 
 ---
 
-## License
+## Creditos
 
-MIT — FatihMakes Industries
+- FatihMakes - por Mark-LIV, la base conceptual.
+- Nous Research - por Hermes 3.
+- Google - por Gemma 4.
+- Alibaba - por Qwen.
+- hexgrad - por Kokoro TTS.
+- OpenAI - por Whisper.
+
+---
+
+Hecho con mucho cafe, paciencia, y ayuda de IAs locales.

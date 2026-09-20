@@ -1,0 +1,110 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+
+# Entornos virtuales
+.venv/
+venv/
+env/
+ENV/
+
+# Configuracion personal (NO SUBIR)
+config/api_keys.json
+memory/long_term.json
+memory/conversation.json
+config/certs/
+
+# Backups
+*.bak
+*.bak_*
+*.py.bak*
+*.txt.bak*
+
+# Cache
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+
+# Sistema
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# VS Code
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# Modelos y binarios
+*.gguf
+*.bin
+*.pt
+*.pth
+*.safetensors
+
+# Audio temporal
+*.wav
+*.mp3
+
+# Proyectos generados
+JarvisProjects/
+jarvis_code.*
+
+# Node (por si acaso)
+node_modules/
+
+# Unity
+Unity/
+[Ll]ibrary/
+[Tt]emp/
+[Oo]bj/
+[Bb]uild/
+[Bb]uilds/
+[Ll]ogs/
+[Uu]ser[Ss]ettings/
+[Mm]emoryCaptures/
+*.csproj
+*.sln
+*.unityproj
+*.pidb
+*.booproj
+
+# Screenshots temporales
+screenshot*.png
+current_screen*.png
+
+# Prototipo web antiguo
+server.py
+
+# Unity
+Unity/
+[Ll]ibrary/
+[Tt]emp/
+[Oo]bj/
+[Bb]uild/
+[Bb]uilds/
+[Ll]ogs/
+[Uu]ser[Ss]ettings/
+[Mm]emoryCaptures/
+*.csproj
+*.sln
+*.unityproj
+*.pidb
+*.booproj
+
+# Screenshots temporales
+screenshot*.png
+current_screen*.png
+
+# Prototipo web antiguo
+server.py
+_debug/

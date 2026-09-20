@@ -76,56 +76,18 @@ def _build_sandbox() -> dict:
 
 
 def _execute_generated_code(code: str, player=None) -> str:
-    if not code or code.strip() == "UNSAFE":
-        return "This action cannot be performed safely."
-
-    # Kod temizleme
-    if code.startswith("```"):
-        lines = code.split("\n")
-        code  = "\n".join(lines[1:-1]).strip()
-
-    sandbox      = _build_sandbox()
-    output_lines = []
-    sandbox["__builtins__"]["print"] = lambda *a: output_lines.append(" ".join(str(x) for x in a))
-
-    try:
-        exec(compile(code, "<jarvis_desktop>", "exec"), sandbox)
-        return "\n".join(output_lines) if output_lines else "Done."
-    except Exception as e:
-        print(f"[Desktop] Exec error: {e}\nCode:\n{code[:300]}")
-        return f"Execution error: {e}"
+    """DESACTIVADO por seguridad - no se ejecuta codigo dinamico."""
+    return (
+        "Ejecucion de codigo dinamico desactivada por seguridad. "
+        "Usa acciones especificas."
+    )
 
 
 def _ask_gemini_for_desktop_action(task: str) -> str:
-    from core.llm_client import call_llm_text
+    """DESACTIVADO - no se genera codigo dinamico."""
+    return "UNSAFE"
 
-    desktop     = str(_get_desktop())
-    os_specific = ""
-    if _OS == "Windows":
-        os_specific = "- ctypes (Windows API calls, read-only)\n- winreg (registry READ only)"
-    else:
-        os_specific = "- subprocess is NOT available; use pyautogui or Path only"
 
-    system = (
-        "You are a desktop automation code generator. "
-        "Output ONLY raw Python code — no explanation, no markdown, no backticks."
-    )
-    prompt = (
-        f"Current OS: {_OS}\nDesktop path: {desktop}\n\n"
-        f"Allowed modules: pyautogui, pathlib.Path, shutil.copy2, shutil.disk_usage, time.sleep\n"
-        f"{os_specific}\n\n"
-        f"Rules: NO deletion, NO subprocess, NO exec/eval, NO imports.\n"
-        f"If unsafe, output exactly: UNSAFE\n\n"
-        f"Task: {task}"
-    )
-    try:
-        code = call_llm_text(prompt, system=system).strip()
-        if code.startswith("```"):
-            lines = code.split("\n")
-            code  = "\n".join(lines[1:-1]).strip()
-        return code
-    except Exception as e:
-        return f"ERROR: {e}"
 
 def set_wallpaper(image_path: str) -> str:
     path = Path(image_path).expanduser().resolve()
@@ -386,6 +348,8 @@ def get_desktop_stats() -> str:
         f"  Path    : {desktop}"
     )
 
+_TASK_DISABLED = True  # modo task ejecuta codigo dinamico: DESACTIVADO por seguridad
+
 def desktop_control(
     parameters: dict = None,
     response=None,
@@ -434,22 +398,18 @@ def desktop_control(
             return get_desktop_stats()
 
         elif action == "task" or task:
-            actual_task = task or params.get("description", "")
-            if not actual_task:
-                return "Please describe what you want to do on the desktop."
-
-            print(f"[Desktop] Asking Gemini: {actual_task}")
-            if player:
-                player.write_log("[Desktop] Generating action...")
-
-            code = _ask_gemini_for_desktop_action(actual_task)
-            return _execute_generated_code(code, player=player)
+            return (
+                "Modo task desactivado (ejecucion de codigo dinamico no segura). "
+                "Usa acciones especificas: wallpaper, wallpaper_url, current_wallpaper, "
+                "organize, clean, list, stats."
+            )
 
         else:
-            if action:
-                code = _ask_gemini_for_desktop_action(action)
-                return _execute_generated_code(code, player=player)
-            return "No action or task specified."
+            return (
+                f"Accion desconocida: '{action}'. "
+                "Acciones validas: wallpaper, wallpaper_url, current_wallpaper, "
+                "organize, clean, list, stats."
+            )
 
     except Exception as e:
         print(f"[Desktop] Error: {e}")
