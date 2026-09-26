@@ -1,7 +1,7 @@
 ﻿{
   "llm_provider": "ollama",
   "llm_url": "http://localhost:11434",
-  "llm_model": "hermes3",
+  "llm_model": "qwen-agresivo-q4:latest",
   "llm_num_gpu": -1,
   "llm_temperature": 0.7,
   "llm_num_predict": 800,
@@ -10,7 +10,7 @@
   "stt_model": "large-v3",
   "stt_language": "es",
   "tts_engine": "kokoro",
-  "tts_voice": "ef_dora",
+  "tts_voice": "ef_Alex",
   "tts_speed": "1.2",
   "camera_index": 0
 }
