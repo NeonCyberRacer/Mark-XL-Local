@@ -3,6 +3,16 @@
 > **J.A.R.V.I.S** — Just A Rather Very Intelligent System
 > Asistente de voz con IA corriendo 100% en local. Sin APIs de pago.
 
+---
+
+## ⚠️ Requisitos de Python
+
+**Este proyecto requiere Python 3.11 o 3.12.**
+
+**Python 3.13 aún NO es compatible** con las dependencias de TTS (Kokoro/spaCy).
+
+Si tienes Python 3.13, instala 3.11 o 3.12 desde [python.org](https://www.python.org/downloads/).
+
 Proyecto personal inspirado en conceptos de Mark-LIV de FatihMakes.
 
 ---

@@ -7,7 +7,7 @@
 #   pip install -r requirements.txt
 #   Platform-specific packages install only on the matching OS.
 
-# ── Core UI & system ──────────────────────────────────────────────────────
+# ── Core UI & system ──────────────────────────────────────────
 PyQt6
 psutil
 pillow
@@ -16,12 +16,12 @@ numpy
 soundfile
 requests
 
-# ── Web automation & search ───────────────────────────────────────────────
+# ── Web automation & search ───────────────────────────────────
 playwright
 beautifulsoup4
 duckduckgo-search
 
-# ── OS control (cross-platform) ───────────────────────────────────────────
+# ── OS control (cross-platform) ───────────────────────────────
 pyautogui
 pyperclip
 pygetwindow
@@ -29,26 +29,29 @@ send2trash
 mss
 opencv-python
 
-# ── OS control (Windows only) ─────────────────────────────────────────────
-pywinauto ; sys_platform == "win32"
-comtypes  ; sys_platform == "win32"
-pycaw     ; sys_platform == "win32"
-win10toast; sys_platform == "win32"
+# ── OS control (Windows only) ─────────────────────────────────
+pywinauto  ; sys_platform == "win32"
+comtypes   ; sys_platform == "win32"
+pycaw      ; sys_platform == "win32"
+win10toast ; sys_platform == "win32"
 
-# ── Media & file processing ───────────────────────────────────────────────
+# ── Media & file processing ───────────────────────────────────
 youtube-transcript-api
 python-pptx
 miniaudio
 
-# ── STT — choose one (auto-installed by main.py based on your config) ─────
-faster-whisper        # Whisper  (default, recommended)
-# vosk               # Vosk     (alternative — uncomment if preferred)
+# ── STT ───────────────────────────────────────────────────────
+faster-whisper        # Whisper  (default)
+# vosk                # Vosk     (alternative)
 
-# ── TTS — choose one (auto-installed by main.py based on your config) ─────
-edge-tts              # EdgeTTS  (default, free, requires internet)
-# kokoro             # Kokoro   (fully offline — uncomment if preferred)
-# elevenlabs         # ElevenLabs (cloud API — uncomment if preferred)
+# ── TTS ───────────────────────────────────────────────────────
+edge-tts              # EdgeTTS  (default)
+# elevenlabs          # ElevenLabs (cloud)
 
-# ── Local LLM ─────────────────────────────────────────────────────────────
-# Ollama must be installed separately: https://ollama.com
-# Then pull a model:  ollama pull qwen2.5:7b
+# ── Kokoro TTS (fully offline) ────────────────────────────────
+kokoro>=0.7.16
+spacy>=3.7.0
+
+# ── Local LLM ─────────────────────────────────────────────────
+# Ollama: https://ollama.com
+# ollama pull qwen2.5:7b

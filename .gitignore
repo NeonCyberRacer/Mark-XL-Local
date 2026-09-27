@@ -108,3 +108,7 @@ current_screen*.png
 # Prototipo web antiguo
 server.py
 _debug/
+*.backup-*
+*.backup.*
+*.backup-*
+*.backup-*
