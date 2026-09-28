@@ -38,7 +38,6 @@ No confundir con **`af_`** (Americano Femenino) o **`am_`** (Americano Masculino
   "tts_voice": "ef_dora",
   "tts_speed": "1.2"
 }
-
 ---
 
 ## Aviso importante
