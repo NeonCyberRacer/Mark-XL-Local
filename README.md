@@ -33,11 +33,14 @@ No confundir con **`af_`** (Americano Femenino) o **`am_`** (Americano Masculino
 **Configuración en `config/api_keys.json`:**
 
 ```json
+
 {
   "tts_engine": "kokoro",
   "tts_voice": "ef_dora",
   "tts_speed": "1.2"
 }
+```
+
 ---
 
 ## Aviso importante
