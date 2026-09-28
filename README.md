@@ -17,6 +17,30 @@ Proyecto personal inspirado en conceptos de Mark-LIV de FatihMakes.
 
 ---
 
+## 🎙️ Voces de Kokoro en español
+
+Kokoro TTS incluye varias voces en español. Las más útiles:
+
+| Voz | Género | Descripción |
+|---|---|---|
+| **`ef_dora`** | Femenina | Voz clara y natural (recomendada) |
+| **`em_alex`** | Masculina | Voz masculina estándar |
+| **`em_santa`** | Masculina | Alternativa, tono más grave |
+
+**⚠️ Importante:** el prefijo **`ef_`** = Español Femenino, **`em_`** = Español Masculino.
+No confundir con **`af_`** (Americano Femenino) o **`am_`** (Americano Masculino).
+
+**Configuración en `config/api_keys.json`:**
+
+```json
+{
+  "tts_engine": "kokoro",
+  "tts_voice": "ef_dora",
+  "tts_speed": "1.2"
+}
+
+---
+
 ## Aviso importante
 
 **Este es un proyecto PERSONAL y EXPERIMENTAL.**
